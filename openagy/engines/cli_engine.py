@@ -45,7 +45,7 @@ class CliEngine:
     Now equipped with:
     - High-throughput low-latency PTY streaming on Unix and pipe streaming on Windows.
     - Native OpenAI Tool Calling / Function Calling support.
-    - Conversation history preservation for multi-turn tool loops.
+    - Conversation history preservation and Windows command-line length budgeting.
     """
 
     def __init__(self):
@@ -56,8 +56,8 @@ class CliEngine:
         is_windows = (os.name == "nt" or sys.platform == "win32")
         candidates = [
             config.AGY_BIN,
-            shutil.which("agy"),
             shutil.which("agy.exe") if is_windows else None,
+            shutil.which("agy"),
             shutil.which("agy.cmd") if is_windows else None,
             str(config.HOME / ".local" / "bin" / ("agy.exe" if is_windows else "agy")),
             str(config.HOME / ".gemini" / "antigravity-cli" / "bin" / ("agy.exe" if is_windows else "agy")),
@@ -78,6 +78,13 @@ class CliEngine:
             if c and os.path.exists(c):
                 if not is_windows and not os.access(c, os.X_OK):
                     continue
+                # On Windows, if a .cmd or .bat was found, check if a native .exe is beside it to avoid cmd.exe length limits
+                if is_windows and c.lower().endswith((".cmd", ".bat")):
+                    base_no_ext = os.path.splitext(c)[0]
+                    exe_sibling = base_no_ext + ".exe"
+                    if os.path.exists(exe_sibling):
+                        logger.info(f"Using native Windows executable instead of batch wrapper: {exe_sibling}")
+                        return exe_sibling
                 logger.info(f"Using local Antigravity binary at: {c}")
                 return c
         logger.warning(f"Defaulting to configured AGY_BIN path: {config.AGY_BIN}")
@@ -115,28 +122,48 @@ class CliEngine:
         except Exception as e:
             logger.debug(f"Could not update settings.json: {e}")
 
-    def _extract_prompt(self, messages: list, tools: Optional[list] = None) -> str:
+    def _get_max_prompt_length(self) -> int:
         """
-        Formats OpenAI conversation history and tools into a structured prompt
-        that allows the local model to understand context and execute tool calls.
+        Determines the safe character budget for the prompt argument.
+        Windows limits:
+        - cmd.exe /c: 8,191 characters
+        - CreateProcessW: 32,767 characters
+        POSIX limits:
+        - Linux/macOS ARG_MAX: 1-2 MB
+        """
+        is_windows = (os.name == "nt" or sys.platform == "win32")
+        if is_windows:
+            if self.bin_path.lower().endswith((".cmd", ".bat")):
+                return 7200
+            return 28000
+        return 200000
+
+    def _extract_prompt(self, messages: list, tools: Optional[list] = None, max_length: int = 28000) -> str:
+        """
+        Formats OpenAI conversation history and tools into a structured prompt,
+        strictly budgeted to fit within OS command line limits (preventing WinError 206).
         """
         system_instructions = []
         conversation_turns = []
 
-        # 1. Inject tool definitions into system instructions if present
+        # 1. Inject tool definitions into system instructions if present (compact format)
         if tools:
             formatted_tools = []
             for t in tools:
                 if t.get("type") == "function":
                     fn = t.get("function", {})
+                    desc = fn.get("description", "")
+                    if len(desc) > 200:
+                        desc = desc[:197] + "..."
                     formatted_tools.append({
                         "name": fn.get("name"),
-                        "description": fn.get("description", ""),
+                        "description": desc,
                         "parameters": fn.get("parameters", {})
                     })
 
             if formatted_tools:
-                tools_json = json.dumps(formatted_tools, indent=2, ensure_ascii=False)
+                # Use compact JSON representation to minimize character footprint
+                tools_json = json.dumps(formatted_tools, separators=(',', ':'), ensure_ascii=False)
                 tool_prompt = (
                     "You are operating as the language model engine for OpenCode.\n"
                     "You have access to the following workspace tools:\n"
@@ -159,7 +186,6 @@ class CliEngine:
             role = msg.get("role", "user")
             content = msg.get("content", "")
 
-            # Format content if it's a list (multimodal or structured text blocks)
             text_content = ""
             if isinstance(content, str):
                 text_content = content
@@ -185,7 +211,6 @@ class CliEngine:
             elif role == "assistant":
                 tc_list = msg.get("tool_calls", [])
                 if tc_list:
-                    # Assistant previous tool invocations
                     tc_blocks = []
                     for tc in tc_list:
                         fn = tc.get("function", {})
@@ -198,27 +223,56 @@ class CliEngine:
                     conversation_turns.append(f"Assistant: {text_content.strip()}")
 
             elif role == "tool":
-                # Result of a tool execution sent back by OpenCode
                 tool_name = msg.get("name") or "tool"
                 call_id = msg.get("tool_call_id") or ""
                 id_info = f" (id: {call_id})" if call_id else ""
-                conversation_turns.append(f"[Tool Execution Result for '{tool_name}'{id_info}]:\n{text_content.strip()}")
+                tool_text = text_content.strip()
+                # Cap excessive tool result outputs in history
+                if len(tool_text) > 4000:
+                    tool_text = tool_text[:2000] + "\n...[truncated]...\n" + tool_text[-1800:]
+                conversation_turns.append(f"[Tool Execution Result for '{tool_name}'{id_info}]:\n{tool_text}")
+
+        # 3. Assemble and budget prompt within max_length
+        sys_str = ""
+        if system_instructions:
+            sys_str = "[System Instructions]\n" + "\n\n".join(system_instructions)
+
+        overhead = len(sys_str) + 100
+        available_history_budget = max(500, max_length - overhead)
+
+        budgeted_turns = []
+        current_len = 0
+        for turn in reversed(conversation_turns):
+            turn_len = len(turn) + 2
+            if current_len + turn_len <= available_history_budget:
+                budgeted_turns.insert(0, turn)
+                current_len += turn_len
+            else:
+                if not budgeted_turns:
+                    allowed = max(200, available_history_budget - 80)
+                    truncated_turn = turn[:allowed] + "\n...[truncated to fit OS limit]..."
+                    budgeted_turns.insert(0, truncated_turn)
+                else:
+                    budgeted_turns.insert(0, "[... earlier history omitted to fit OS command limit ...]")
+                break
 
         prompt_parts = []
-        if system_instructions:
-            prompt_parts.append("[System Instructions]\n" + "\n\n".join(system_instructions))
+        if sys_str:
+            prompt_parts.append(sys_str)
 
-        if len(conversation_turns) == 1 and conversation_turns[0].startswith("User: "):
-            # Single user turn, remove redundant prefix
-            prompt_parts.append(conversation_turns[0][6:])
-        elif conversation_turns:
-            prompt_parts.append("[Conversation History]\n" + "\n\n".join(conversation_turns))
+        if len(budgeted_turns) == 1 and budgeted_turns[0].startswith("User: "):
+            prompt_parts.append(budgeted_turns[0][6:])
+        elif budgeted_turns:
+            prompt_parts.append("[Conversation History]\n" + "\n\n".join(budgeted_turns))
 
-        return "\n\n".join(prompt_parts)
+        final_prompt = "\n\n".join(prompt_parts)
+        if len(final_prompt) > max_length:
+            final_prompt = final_prompt[:max_length - 60] + "\n...[truncated]..."
+
+        return final_prompt
 
     def _parse_tool_call(self, text: str) -> Optional[Dict[str, Any]]:
         """Parses a tool call from a completed block or JSON response."""
-        # 1. Check for ```tool_call ... ``` or <tool_call> ... </tool_call>
         match = TOOL_CALL_REGEX.search(text)
         if match:
             raw_json = match.group(1).strip()
@@ -229,7 +283,6 @@ class CliEngine:
             except Exception:
                 pass
 
-        # 2. Check if the entire string is a JSON object with name & arguments
         trimmed = text.strip()
         if trimmed.startswith("{") and trimmed.endswith("}"):
             try:
@@ -268,7 +321,6 @@ class CliEngine:
 
             try:
                 while True:
-                    # Small buffer read (128 bytes) for immediate, low-latency streaming
                     chunk = await reader.read(128)
                     if not chunk:
                         break
@@ -315,7 +367,8 @@ class CliEngine:
         tools = openai_req.get("tools", [])
         chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
-        prompt = self._extract_prompt(openai_req.get("messages", []), tools=tools)
+        max_prompt_len = self._get_max_prompt_length()
+        prompt = self._extract_prompt(openai_req.get("messages", []), tools=tools, max_length=max_prompt_len)
 
         # Build command: all flags MUST precede '-p' for Go CLI flag parsing
         cmd = [self.bin_path, "--dangerously-skip-permissions"]
@@ -323,11 +376,11 @@ class CliEngine:
             cmd.extend(["--model", resolved_model])
         cmd.extend(["-p", prompt])
 
-        # On Windows, wrap .cmd and .bat binaries with cmd.exe /c
+        # On Windows, wrap .cmd and .bat binaries with cmd.exe /c if an exe was not resolved
         if (os.name == "nt" or sys.platform == "win32") and self.bin_path.lower().endswith((".cmd", ".bat")):
             cmd = ["cmd.exe", "/c"] + cmd
 
-        logger.info(f"Delegating to local Antigravity CLI: {self.bin_path} (model: {resolved_model}, tools={len(tools)})")
+        logger.info(f"Delegating to local Antigravity CLI: {self.bin_path} (model: {resolved_model}, tools={len(tools)}, prompt_len={len(prompt)})")
 
         stream_gen = None
         if pty is None or os.name == "nt" or sys.platform == "win32":
@@ -350,8 +403,6 @@ class CliEngine:
 
                 accumulated_output.append(clean_chunk)
 
-                # If tools are enabled, check if a tool call tag is starting
-                # If no tool tag in stream, stream chunk immediately to minimize latency
                 full_so_far = "".join(accumulated_output)
                 if not is_tool_mode or ("```tool_call" not in full_so_far and "<tool_call>" not in full_so_far):
                     yield OpenAIAdapter.create_chat_completion_chunk(
@@ -364,7 +415,6 @@ class CliEngine:
                 chunk_id, resolved_model, content=f"\n[OpenAGY Local CLI Error: {e}]"
             )
 
-        # After process completes: if tools are defined, check if a tool was called
         if is_tool_mode:
             full_text = "".join(accumulated_output)
             tool_data = self._parse_tool_call(full_text)
@@ -389,7 +439,6 @@ class CliEngine:
                 yield "data: [DONE]\n\n"
                 return
 
-        # End stream normally
         yield OpenAIAdapter.create_chat_completion_chunk(
             chunk_id, resolved_model, finish_reason="stop"
         )
