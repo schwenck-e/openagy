@@ -12,11 +12,15 @@ def find_default_agy_bin() -> str:
     is_windows = (sys.platform == "win32" or os.name == "nt")
     home = Path.home()
 
-    # 1. Search PATH
+    # 1. Search PATH (prioritize .exe over .cmd/.bat)
     names = ["agy.exe", "agy.cmd", "agy.bat", "agy"] if is_windows else ["agy"]
     for name in names:
         found = shutil.which(name)
         if found:
+            if is_windows and found.lower().endswith((".cmd", ".bat")):
+                exe_candidate = os.path.splitext(found)[0] + ".exe"
+                if os.path.exists(exe_candidate):
+                    return exe_candidate
             return found
 
     # 2. Known default installation directories
@@ -53,7 +57,12 @@ def find_default_agy_bin() -> str:
 
     for c in candidates:
         if c.exists():
-            return str(c)
+            str_c = str(c)
+            if is_windows and str_c.lower().endswith((".cmd", ".bat")):
+                exe_candidate = os.path.splitext(str_c)[0] + ".exe"
+                if os.path.exists(exe_candidate):
+                    return exe_candidate
+            return str_c
 
     # 3. Fallback path if not yet installed
     if is_windows:
