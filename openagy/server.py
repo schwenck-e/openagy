@@ -106,7 +106,8 @@ async def chat_completions(request: Request, authorized: bool = Security(verify_
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
-                "Content-Type": "text/event-stream"
+                "Content-Type": "text/event-stream",
+                "X-Accel-Buffering": "no"
             }
         )
     else:

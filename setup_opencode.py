@@ -162,7 +162,10 @@ def update_single_config(config_path: Path, port: int, api_key: str):
         "npm": "@ai-sdk/openai-compatible",
         "options": {
             "baseURL": f"http://127.0.0.1:{port}/v1",
-            "apiKey": api_key
+            "apiKey": api_key,
+            "timeout": 600000,
+            "headerTimeout": 600000,
+            "chunkTimeout": 900000
         },
         "models": MODELS_CATALOG
     }

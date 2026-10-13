@@ -167,10 +167,13 @@ class OpenAIAdapter:
         model: str,
         content: Optional[str] = None,
         tool_calls: Optional[List[Dict[str, Any]]] = None,
-        finish_reason: Optional[str] = None
+        finish_reason: Optional[str] = None,
+        role: Optional[str] = None
     ) -> str:
         """Formats an SSE chunk in OpenAI specification."""
         delta: Dict[str, Any] = {}
+        if role is not None:
+            delta["role"] = role
         if content is not None:
             delta["content"] = content
         if tool_calls is not None:
