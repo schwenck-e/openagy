@@ -275,6 +275,12 @@ class CliEngine:
         prompt_parts = []
         if sys_str:
             prompt_parts.append(sys_str)
+        else:
+            prompt_parts.append(
+                "[System Instruction]\n"
+                "You are operating as the language model engine for OpenCode. "
+                "Provide direct, high-quality answers, code solutions, and explanations without executing local terminal commands."
+            )
 
         if len(budgeted_turns) == 1 and budgeted_turns[0].startswith("User: "):
             prompt_parts.append(budgeted_turns[0][6:])
