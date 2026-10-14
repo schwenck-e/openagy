@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 import sys
 from openagy.config import config
 
@@ -12,7 +13,10 @@ def main():
     parser.add_argument("--api-key", type=str, default=config.API_KEY, help="API Key required for requests")
     parser.add_argument("--require-key", action="store_true", default=config.REQUIRE_API_KEY,
                         help="Enforce API Key validation")
-    parser.add_argument("--reload", action="store_true", help="Enable auto-reload for development")
+    parser.add_argument("--reload", dest="reload", action="store_true", help="Enable auto-reload on file changes")
+    parser.add_argument("--no-reload", dest="reload", action="store_false", help="Disable auto-reload")
+    default_reload = os.getenv("OPENAGY_RELOAD", "true").lower() in ("true", "1", "yes")
+    parser.set_defaults(reload=default_reload)
 
     args = parser.parse_args()
 

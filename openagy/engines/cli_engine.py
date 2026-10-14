@@ -38,12 +38,13 @@ class CliEngine:
     by the local Antigravity session.
 
     Now equipped with:
-    - Robust, non-hanging pipe streaming on macOS (eliminating BSD kqueue PTY EOF hangs).
+    - Queue-buffered asynchronous subprocess streaming ensuring keep-alive pings
+      never cancel or kill the underlying subprocess.
+    - Robust, non-hanging pipe streaming on macOS, Linux, and Windows.
     - Concurrent stderr draining to eliminate OS pipe buffer deadlocks.
     - Zero-latency initial SSE role handshake chunk (< 5ms) to satisfy client response timers.
-    - Periodic SSE keep-alive pings (: ping) to prevent socket drops during deep reasoning.
     - Native OpenAI Tool Calling / Function Calling support.
-    - Conversation history preservation and Windows command-line length budgeting (WinError 206 fix).
+    - Conversation history preservation and Windows command-line length budgeting.
     """
 
     def __init__(self):
@@ -311,11 +312,10 @@ class CliEngine:
     async def _stream_subprocess_pipe(self, cmd: list[str]) -> AsyncGenerator[str, None]:
         """
         Universal high-throughput, low-latency streaming using standard asyncio
-        subprocess pipes with concurrent stderr draining.
-        Guarantees:
-        - Zero-hang EOF on macOS (completely avoids BSD kqueue PTY master descriptor hangs).
-        - Zero-deadlock on Windows (continuously empties 4KB stderr buffer).
-        - Direct unbuffered token emission from Go's os.Stdout.
+        subprocess pipes with an asynchronous queue and concurrent stderr draining.
+        - Heartbeat safe: queue reads can time out without cancelling the subprocess.
+        - Zero-hang EOF on macOS (no PTY kqueue bugs).
+        - Zero-deadlock on Windows (continuously empties stderr buffer).
         """
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -325,7 +325,20 @@ class CliEngine:
             env=self._build_env()
         )
 
+        queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
         stderr_chunks: List[bytes] = []
+
+        async def read_stdout():
+            try:
+                while True:
+                    chunk = await proc.stdout.read(128)
+                    if not chunk:
+                        break
+                    await queue.put(chunk.decode("utf-8", errors="replace"))
+            except Exception as e:
+                logger.debug(f"Stdout reader exception: {e}")
+            finally:
+                await queue.put(None)
 
         async def drain_stderr():
             try:
@@ -337,41 +350,71 @@ class CliEngine:
             except Exception as e:
                 logger.debug(f"Stderr drain exception: {e}")
 
-        drain_task = asyncio.create_task(drain_stderr())
+        stdout_task = asyncio.create_task(read_stdout())
+        stderr_task = asyncio.create_task(drain_stderr())
 
         try:
             while True:
-                # 128 bytes read for immediate, real-time token delivery
-                chunk = await proc.stdout.read(128)
-                if not chunk:
+                try:
+                    # Heartbeat: if no token for 3s, yield SSE keep-alive without cancelling reader
+                    chunk = await asyncio.wait_for(queue.get(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"
+                    continue
+
+                if chunk is None:
+                    # EOF reached
                     break
-                yield chunk.decode("utf-8", errors="replace")
+
+                yield chunk
+
+            # Await process exit and tasks cleanly without blocking indefinitely
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                if proc.returncode is None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                await proc.wait()
+
+            try:
+                await asyncio.wait_for(stdout_task, timeout=2.0)
+            except Exception:
+                stdout_task.cancel()
+
+            try:
+                await asyncio.wait_for(stderr_task, timeout=2.0)
+            except Exception:
+                stderr_task.cancel()
+
+            if proc.returncode != 0:
+                err_text = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
+                if err_text:
+                    logger.error(f"Antigravity process failed with code {proc.returncode}: {err_text}")
+                    yield f"\n[Antigravity Process Error (exit code {proc.returncode}): {err_text}]"
+
         except asyncio.CancelledError:
+            # Client aborted connection
             if proc.returncode is None:
                 try:
                     proc.terminate()
                 except Exception:
                     pass
+            stdout_task.cancel()
+            stderr_task.cancel()
             raise
         finally:
             if proc.returncode is None:
                 try:
-                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                    proc.terminate()
                 except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-            try:
-                await asyncio.wait_for(drain_task, timeout=2.0)
-            except Exception:
-                drain_task.cancel()
-
-        if proc.returncode != 0:
-            err_text = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
-            if err_text:
-                logger.error(f"Antigravity process failed with code {proc.returncode}: {err_text}")
-                yield f"\n[Antigravity Process Error (exit code {proc.returncode}): {err_text}]"
+                    pass
+            if not stdout_task.done():
+                stdout_task.cancel()
+            if not stderr_task.done():
+                stderr_task.cancel()
 
     async def generate_stream(
         self,
@@ -382,11 +425,11 @@ class CliEngine:
         tools = openai_req.get("tools", [])
         chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
-        # 1. Immediately emit initial role chunk (< 5ms)
+        # 1. Immediately emit initial role handshake chunk (< 5ms)
         # This sends HTTP 200 headers and initial SSE frame instantly to OpenCode / AI SDK,
         # satisfying the client's initial response timeout immediately.
         yield OpenAIAdapter.create_chat_completion_chunk(
-            chunk_id, resolved_model, role="assistant"
+            chunk_id, requested_model, role="assistant", content=""
         )
 
         max_prompt_len = self._get_max_prompt_length()
@@ -410,17 +453,10 @@ class CliEngine:
         is_tool_mode = bool(tools)
 
         try:
-            stream_iter = stream_gen.__aiter__()
-            while True:
-                try:
-                    # Emit SSE comment keep-alive if subprocess takes longer than 3s to produce chunks
-                    raw_chunk = await asyncio.wait_for(stream_iter.__anext__(), timeout=3.0)
-                except asyncio.TimeoutError:
-                    # Keep-alive comment: resets client socket / chunk inactivity timer
-                    yield ": ping\n\n"
+            async for raw_chunk in stream_gen:
+                if raw_chunk.startswith(":"):
+                    yield raw_chunk
                     continue
-                except StopAsyncIteration:
-                    break
 
                 clean_chunk = strip_ansi(raw_chunk)
                 if not clean_chunk:
@@ -431,13 +467,13 @@ class CliEngine:
                 full_so_far = "".join(accumulated_output)
                 if not is_tool_mode or ("```tool_call" not in full_so_far and "<tool_call>" not in full_so_far):
                     yield OpenAIAdapter.create_chat_completion_chunk(
-                        chunk_id, resolved_model, content=clean_chunk
+                        chunk_id, requested_model, content=clean_chunk
                     )
 
         except Exception as e:
             logger.error(f"Error executing local Antigravity CLI: {e}")
             yield OpenAIAdapter.create_chat_completion_chunk(
-                chunk_id, resolved_model, content=f"\n[OpenAGY Local CLI Error: {e}]"
+                chunk_id, requested_model, content=f"\n[OpenAGY Local CLI Error: {e}]"
             )
 
         # After process completes: if tools are defined, check if a tool was called
@@ -460,21 +496,21 @@ class CliEngine:
                 }]
                 logger.info(f"Tool call emitted by local Antigravity: {tool_name}")
                 yield OpenAIAdapter.create_chat_completion_chunk(
-                    chunk_id, resolved_model, tool_calls=tool_calls_payload, finish_reason="tool_calls"
+                    chunk_id, requested_model, tool_calls=tool_calls_payload, finish_reason="tool_calls"
                 )
                 yield "data: [DONE]\n\n"
                 return
 
         # End stream normally
         yield OpenAIAdapter.create_chat_completion_chunk(
-            chunk_id, resolved_model, finish_reason="stop"
+            chunk_id, requested_model, finish_reason="stop"
         )
         yield "data: [DONE]\n\n"
 
     async def generate(self, openai_req: Dict[str, Any]) -> Dict[str, Any]:
         full_text = []
         tool_calls = []
-        model = resolve_model_name(openai_req.get("model", "gemini-3.8-flash-high"))
+        requested_model = openai_req.get("model", "gemini-3.8-flash-high")
         req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
         async for chunk_str in self.generate_stream(openai_req):
@@ -496,7 +532,7 @@ class CliEngine:
 
         return OpenAIAdapter.create_chat_completion_response(
             req_id,
-            model,
+            requested_model,
             content="".join(full_text),
             tool_calls=tool_calls if tool_calls else None
         )

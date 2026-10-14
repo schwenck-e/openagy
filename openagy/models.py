@@ -75,11 +75,16 @@ MODEL_ALIASES: Dict[str, str] = {
 }
 
 def resolve_model_name(requested_model: str) -> str:
-    """Resolves an alias to the canonical Antigravity model ID."""
+    """Resolves an alias or provider-prefixed name to the canonical Antigravity model ID."""
     if not requested_model:
         return "gemini-3.8-flash-high"
     
     clean_name = requested_model.strip()
+    if clean_name.startswith("openagy/"):
+        clean_name = clean_name[8:]
+    elif "/" in clean_name:
+        clean_name = clean_name.split("/", 1)[1]
+
     if clean_name in MODEL_ALIASES:
         return MODEL_ALIASES[clean_name]
     
