@@ -8,11 +8,6 @@ import sys
 import uuid
 from typing import AsyncGenerator, Dict, Any, List, Optional, Tuple
 
-try:
-    import pty
-except ImportError:
-    pty = None
-
 from openagy.config import config
 from openagy.models import resolve_model_name
 from openagy.adapter import OpenAIAdapter
@@ -43,8 +38,9 @@ class CliEngine:
     by the local Antigravity session.
 
     Now equipped with:
-    - Deadlock-free asynchronous subprocess execution with concurrent stderr draining.
-    - Zero-latency initial SSE role handshake chunk (< 5ms) to prevent client timeouts.
+    - Robust, non-hanging pipe streaming on macOS (eliminating BSD kqueue PTY EOF hangs).
+    - Concurrent stderr draining to eliminate OS pipe buffer deadlocks.
+    - Zero-latency initial SSE role handshake chunk (< 5ms) to satisfy client response timers.
     - Periodic SSE keep-alive pings (: ping) to prevent socket drops during deep reasoning.
     - Native OpenAI Tool Calling / Function Calling support.
     - Conversation history preservation and Windows command-line length budgeting (WinError 206 fix).
@@ -123,6 +119,25 @@ class CliEngine:
                 logger.info(f"Updated permissions.allow in {settings_path}")
         except Exception as e:
             logger.debug(f"Could not update settings.json: {e}")
+
+    def _build_env(self) -> Dict[str, str]:
+        """Prepares an execution environment ensuring PATH and UTF-8 encoding across macOS, Linux, and Windows."""
+        env = os.environ.copy()
+        extra_paths = [
+            str(config.HOME / ".local" / "bin"),
+            str(config.HOME / ".gemini" / "antigravity-cli" / "bin"),
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin"
+        ]
+        current_path = env.get("PATH", "")
+        for p in extra_paths:
+            if p not in current_path and os.path.exists(p):
+                current_path = f"{p}:{current_path}"
+        env["PATH"] = current_path
+        env["PYTHONIOENCODING"] = "utf-8"
+        return env
 
     def _get_max_prompt_length(self) -> int:
         """
@@ -293,84 +308,21 @@ class CliEngine:
 
         return None
 
-    async def _stream_subprocess_pty(self, cmd: list[str]) -> AsyncGenerator[str, None]:
-        """
-        Executes the command inside a pseudo-terminal (PTY) with small chunk reads
-        (128 bytes) to achieve low-latency, immediate token streaming.
-        Stderr is drained concurrently to avoid deadlock and keep terminal output clean.
-        """
-        master_fd, slave_fd = pty.openpty()
-        slave_closed = False
-        stderr_chunks: List[bytes] = []
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=slave_fd,
-                stderr=asyncio.subprocess.PIPE,
-                close_fds=True
-            )
-            os.close(slave_fd)
-            slave_closed = True
-
-            async def drain_stderr():
-                try:
-                    while True:
-                        err_chunk = await proc.stderr.read(1024)
-                        if not err_chunk:
-                            break
-                        stderr_chunks.append(err_chunk)
-                except Exception:
-                    pass
-
-            drain_task = asyncio.create_task(drain_stderr())
-
-            loop = asyncio.get_running_loop()
-            reader = asyncio.StreamReader()
-            protocol = asyncio.StreamReaderProtocol(reader)
-            transport, _ = await loop.connect_read_pipe(
-                lambda: protocol, os.fdopen(master_fd, 'rb', buffering=0)
-            )
-
-            try:
-                while True:
-                    chunk = await reader.read(128)
-                    if not chunk:
-                        break
-                    text = chunk.decode("utf-8", errors="replace")
-                    yield text
-            finally:
-                transport.close()
-
-            await proc.wait()
-            try:
-                await asyncio.wait_for(drain_task, timeout=1.0)
-            except Exception:
-                drain_task.cancel()
-
-            if proc.returncode != 0:
-                err_text = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
-                if err_text:
-                    logger.error(f"Antigravity process failed with code {proc.returncode}: {err_text}")
-                    yield f"\n[Antigravity Process Error (exit code {proc.returncode}): {err_text}]"
-        finally:
-            if not slave_closed:
-                try:
-                    os.close(slave_fd)
-                except Exception:
-                    pass
-
     async def _stream_subprocess_pipe(self, cmd: list[str]) -> AsyncGenerator[str, None]:
         """
-        Executes the command using standard asyncio subprocess pipes with
-        concurrent stderr draining to eliminate OS pipe buffer deadlocks.
+        Universal high-throughput, low-latency streaming using standard asyncio
+        subprocess pipes with concurrent stderr draining.
+        Guarantees:
+        - Zero-hang EOF on macOS (completely avoids BSD kqueue PTY master descriptor hangs).
+        - Zero-deadlock on Windows (continuously empties 4KB stderr buffer).
+        - Direct unbuffered token emission from Go's os.Stdout.
         """
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            env=self._build_env()
         )
 
         stderr_chunks: List[bytes] = []
@@ -389,6 +341,7 @@ class CliEngine:
 
         try:
             while True:
+                # 128 bytes read for immediate, real-time token delivery
                 chunk = await proc.stdout.read(128)
                 if not chunk:
                     break
@@ -451,15 +404,7 @@ class CliEngine:
 
         logger.info(f"Delegating to local Antigravity CLI: {self.bin_path} (model: {resolved_model}, tools={len(tools)}, prompt_len={len(prompt)})")
 
-        stream_gen = None
-        if pty is None or os.name == "nt" or sys.platform == "win32":
-            stream_gen = self._stream_subprocess_pipe(cmd)
-        else:
-            try:
-                stream_gen = self._stream_subprocess_pty(cmd)
-            except Exception as e:
-                logger.debug(f"PTY initialization failed ({e}), falling back to standard pipe.")
-                stream_gen = self._stream_subprocess_pipe(cmd)
+        stream_gen = self._stream_subprocess_pipe(cmd)
 
         accumulated_output = []
         is_tool_mode = bool(tools)

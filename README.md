@@ -66,9 +66,9 @@ O OpenAGY foi desenvolvido para funcionar sem atritos em qualquer sistema operac
 
 | Sistema | Terminal Suportado | Modo de Streaming | Descoberta do Binário `agy` | Caminho do `opencode.json` |
 | :--- | :--- | :--- | :--- | :--- |
-| **Linux** | Bash, Zsh, Sh | Pseudo-terminal (PTY) de baixa latência | `~/.local/bin`, `/usr/local/bin`, `/usr/bin`, `PATH` | `$XDG_CONFIG_HOME/opencode/` ou `~/.config/opencode/` |
+| **Linux** | Bash, Zsh, Sh | Pipes assíncronos (`asyncio.subprocess.PIPE`) | `~/.local/bin`, `/usr/local/bin`, `/usr/bin`, `PATH` | `$XDG_CONFIG_HOME/opencode/` ou `~/.config/opencode/` |
 | **Windows** | CMD, PowerShell | Pipes assíncronos (`asyncio.subprocess.PIPE`) | `agy.exe`, `agy.cmd`, `%LOCALAPPDATA%`, `%USERPROFILE%\.local\bin` | `%APPDATA%\opencode\` ou `%USERPROFILE%\.config\opencode\` |
-| **macOS** | Zsh, Bash | Pseudo-terminal (PTY) de baixa latência | `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` | `~/.config/opencode/` |
+| **macOS** | Zsh, Bash | Pipes assíncronos (`asyncio.subprocess.PIPE`) | `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` | `~/.config/opencode/` |
 
 ---
 
@@ -310,13 +310,15 @@ curl http://127.0.0.1:8080/v1/models
 
 ### 7. `Timed out waiting for response data` no OpenCode
 * **Causa:**
-  1. No Windows e em pipes assíncronos, o Antigravity direciona logs e diagnósticos para `stderr`. Se o canal de `stderr` não for drenado em paralelo com o `stdout`, o buffer de pipe do Windows (4 KB) satura, travando o processo em deadlock.
-  2. O cliente do OpenCode (`@ai-sdk/openai-compatible`) espera os primeiros dados de resposta (SSE) rapidamente. Caso o modelo demore para aquecer ou realize raciocínio profundo, o cliente encerra a conexão por inatividade.
+  1. **No macOS:** O motor de pseudo-terminal (PTY) em Python sofre de uma limitação do backend `kqueue` do Darwin/BSD: quando o subprocesso filho encerra e fecha o lado escravo do PTY, o descritor mestre não sinaliza o evento EOF (fim de arquivo), fazendo com que leitores assíncronos fiquem aguardando indefinidamente em bloqueio.
+  2. **No Windows:** Em pipes anônimos sem drenagem concorrente, o Antigravity envia diagnósticos para `stderr`. Quando o buffer de 4 KB do Windows satura, o processo entra em deadlock esperando espaço no buffer enquanto o leitor espera por `stdout`.
+  3. **No Cliente OpenCode:** O `@ai-sdk/openai-compatible` possui um timer estrito aguardando o primeiro evento de resposta SSE. Qualquer atraso na inicialização do processo local ou pausas prolongadas durante raciocínio profundo causavam o encerramento da conexão.
 * **Solução:**
-  1. O OpenAGY drena o `stderr` de forma concorrente em uma tarefa assíncrona dedicada, eliminando qualquer risco de deadlock de buffer de pipe.
-  2. A ponte emite imediatamente um chunk inicial de handshake (`role: "assistant"`) em < 5 ms, reiniciando o relógio de timeout do cliente.
-  3. Durante raciocínio profundo ou pausas na geração, a ponte emite pings periódicos (`: ping\n\n`) via Server-Sent Events para manter os sockets HTTP e conexões Node/Undici ativas.
-  4. O script `setup_opencode.py` configura automaticamente tempos limite estendidos (`timeout`, `headerTimeout`, `chunkTimeout`) no `opencode.json`.
+  1. O OpenAGY migrou para **pipes assíncronos universais (`asyncio.subprocess.PIPE`) com leitura sem buffer (128 bytes)**, eliminando por completo o PTY e garantindo detecção instantânea de EOF no macOS, Linux e Windows.
+  2. Drenagem concorrente de `stderr` em segundo plano para evitar saturação de buffers.
+  3. Emissão instantânea de chunk inicial de handshake (`role: "assistant"`) em < 5 ms, reiniciando o relógio de timeout do OpenCode.
+  4. Emissão periódica de pings de keep-alive (`: ping\n\n`) via Server-Sent Events durante etapas de raciocínio profundo.
+  5. Configuração automática de tempos limite estendidos (`timeout: 600000`, `headerTimeout: 600000`, `chunkTimeout: 900000`) em `opencode.json`.
 
 ---
 
