@@ -180,19 +180,20 @@ class CliEngine:
                 tools_json = json.dumps(formatted_tools, indent=None, ensure_ascii=False)
                 tool_prompt = (
                     "You are operating as the language model engine for OpenCode.\n"
-                    "You have access to the following workspace tools:\n"
+                    "CRITICAL: Do NOT execute local CLI tools, shell commands, or file edits yourself.\n"
+                    "You only output completions. OpenCode has provided these workspace tools:\n"
                     f"{tools_json}\n\n"
                     "If you need to call a tool, you MUST output a tool call block in this exact JSON format:\n"
                     "```tool_call\n"
                     "{\"name\": \"<function_name>\", \"arguments\": { ... }}\n"
                     "```\n"
-                    "If no tool is required, respond directly with normal text."
+                    "If no tool is required, respond directly and concisely with normal text."
                 )
                 system_instructions.append(tool_prompt)
         else:
             system_instructions.append(
                 "You are operating as the language model engine for OpenCode. "
-                "Provide direct, high-quality answers, code solutions, and explanations without invoking background CLI commands."
+                "Provide direct, high-quality answers, code solutions, and explanations without invoking background CLI commands or tools."
             )
 
         # 2. Process conversation history

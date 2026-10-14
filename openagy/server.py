@@ -1,6 +1,9 @@
+import collections
 import json
 import logging
-from typing import Optional
+import time
+import uuid
+from typing import Optional, Dict, Any
 from fastapi import FastAPI, Request, HTTPException, Security, status
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,6 +16,15 @@ from openagy.engines.cli_engine import CliEngine
 from openagy.auth import auth_manager
 
 logger = logging.getLogger("openagy.server")
+
+# File logger for persistent diagnostic tracking
+try:
+    fh = logging.FileHandler("openagy.log", encoding="utf-8")
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    logging.getLogger("openagy").addHandler(fh)
+    logging.getLogger("openagy.engine.cli").addHandler(fh)
+except Exception:
+    pass
 
 app = FastAPI(
     title="OpenAGY - OpenCode to Antigravity Bridge",
@@ -33,6 +45,10 @@ security = HTTPBearer(auto_error=False)
 
 cloudcode_engine = CloudCodeEngine()
 cli_engine = CliEngine()
+
+# Diagnostic request trackers
+REQUEST_HISTORY = collections.deque(maxlen=30)
+ACTIVE_REQUESTS: Dict[str, Dict[str, Any]] = {}
 
 def get_engine():
     if config.ENGINE == "cloudcode":
@@ -75,10 +91,27 @@ async def health_check():
         "active_engine": config.ENGINE,
         "local_antigravity_bin": agy_path,
         "local_antigravity_ready": agy_exists,
+        "active_requests": len(ACTIVE_REQUESTS),
         "endpoints": {
             "models": "/v1/models",
-            "chat_completions": "/v1/chat/completions"
+            "chat_completions": "/v1/chat/completions",
+            "debug_status": "/debug/status"
         }
+    }
+
+@app.get("/debug/status")
+async def debug_status():
+    """Returns real-time status of active and recent requests for diagnosis."""
+    now = time.time()
+    active = []
+    for r in list(ACTIVE_REQUESTS.values()):
+        item = dict(r)
+        item["elapsed_seconds"] = round(now - item["start_time"], 2)
+        active.append(item)
+    return {
+        "active_requests_count": len(active),
+        "active_requests": active,
+        "recent_history": list(REQUEST_HISTORY)
     }
 
 @app.get("/v1/models")
@@ -96,12 +129,48 @@ async def chat_completions(request: Request, authorized: bool = Security(verify_
 
     stream = body.get("stream", False)
     engine = get_engine()
+    model = body.get("model", "unknown")
+    tools = body.get("tools", [])
 
-    logger.info(f"Incoming completion request for model '{body.get('model')}' (stream={stream})")
+    req_id = f"req-{uuid.uuid4().hex[:8]}"
+    req_info: Dict[str, Any] = {
+        "id": req_id,
+        "start_time": time.time(),
+        "model": model,
+        "stream": stream,
+        "tools_count": len(tools),
+        "status": "processing",
+        "tokens_emitted": 0,
+        "duration": 0.0,
+        "error": None
+    }
+    ACTIVE_REQUESTS[req_id] = req_info
+
+    logger.info(f"[{req_id}] Incoming completion request for model '{model}' (stream={stream}, tools={len(tools)})")
 
     if stream:
+        async def tracked_stream():
+            try:
+                async for chunk in engine.generate_stream(body):
+                    if not chunk.startswith(":"):
+                        req_info["tokens_emitted"] += 1
+                        if req_info["status"] == "processing":
+                            req_info["status"] = "streaming"
+                    yield chunk
+                req_info["status"] = "completed"
+            except Exception as e:
+                req_info["status"] = "error"
+                req_info["error"] = str(e)
+                logger.error(f"[{req_id}] Streaming error: {e}")
+                raise
+            finally:
+                req_info["duration"] = round(time.time() - req_info["start_time"], 2)
+                ACTIVE_REQUESTS.pop(req_id, None)
+                REQUEST_HISTORY.append(req_info)
+                logger.info(f"[{req_id}] Request finished in {req_info['duration']}s (status={req_info['status']}, tokens={req_info['tokens_emitted']})")
+
         return StreamingResponse(
-            engine.generate_stream(body),
+            tracked_stream(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -111,5 +180,17 @@ async def chat_completions(request: Request, authorized: bool = Security(verify_
             }
         )
     else:
-        resp = await engine.generate(body)
-        return JSONResponse(content=resp)
+        try:
+            resp = await engine.generate(body)
+            req_info["status"] = "completed"
+            return JSONResponse(content=resp)
+        except Exception as e:
+            req_info["status"] = "error"
+            req_info["error"] = str(e)
+            logger.error(f"[{req_id}] Non-streaming error: {e}")
+            raise
+        finally:
+            req_info["duration"] = round(time.time() - req_info["start_time"], 2)
+            ACTIVE_REQUESTS.pop(req_id, None)
+            REQUEST_HISTORY.append(req_info)
+            logger.info(f"[{req_id}] Request finished in {req_info['duration']}s (status={req_info['status']})")

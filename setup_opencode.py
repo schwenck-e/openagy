@@ -17,15 +17,22 @@ from typing import List, Optional
 ANTIGRAVITY_SETTINGS_PATH = Path.home() / ".gemini" / "antigravity-cli" / "settings.json"
 
 MODELS_CATALOG = {
-    "gemini-3.8-flash-high": {
-        "name": "Gemini 3.8 Flash High (Antigravity)",
+    "gemini-3.8-flash-low": {
+        "name": "Gemini 3.8 Flash Low (Fast / Low Latency)",
         "limit": {
             "context": 1048576,
             "output": 8192
         }
     },
     "gemini-3.8-flash-medium": {
-        "name": "Gemini 3.8 Flash Medium (Antigravity)",
+        "name": "Gemini 3.8 Flash Medium (Balanced)",
+        "limit": {
+            "context": 1048576,
+            "output": 8192
+        }
+    },
+    "gemini-3.8-flash-high": {
+        "name": "Gemini 3.8 Flash High (Deep Reasoning)",
         "limit": {
             "context": 1048576,
             "output": 8192
