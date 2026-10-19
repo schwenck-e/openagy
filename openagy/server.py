@@ -20,9 +20,11 @@ logger = logging.getLogger("openagy.server")
 # File logger for persistent diagnostic tracking
 try:
     fh = logging.FileHandler("openagy.log", encoding="utf-8")
+    fh.setLevel(logging.INFO)
     fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-    logging.getLogger("openagy").addHandler(fh)
-    logging.getLogger("openagy.engine.cli").addHandler(fh)
+    l = logging.getLogger("openagy")
+    l.setLevel(logging.INFO)
+    l.addHandler(fh)
 except Exception:
     pass
 

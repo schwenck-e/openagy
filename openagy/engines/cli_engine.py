@@ -458,6 +458,8 @@ class CliEngine:
 
         accumulated_output = []
         is_tool_mode = bool(tools)
+        # Track whether we are inside a tool_call block to suppress raw JSON from the text stream
+        inside_tool_block = False
 
         try:
             async for raw_chunk in stream_gen:
@@ -471,8 +473,20 @@ class CliEngine:
 
                 accumulated_output.append(clean_chunk)
 
-                full_so_far = "".join(accumulated_output)
-                if not is_tool_mode or ("```tool_call" not in full_so_far and "<tool_call>" not in full_so_far):
+                if is_tool_mode:
+                    full_so_far = "".join(accumulated_output)
+                    # Once a tool_call block opens, suppress further raw output from the text stream.
+                    # This avoids sending raw JSON to the user while still accumulating it for parsing.
+                    if not inside_tool_block:
+                        if "```tool_call" in full_so_far or "<tool_call>" in full_so_far:
+                            inside_tool_block = True
+                        else:
+                            # Still within normal text — stream it so OpenCode sees activity
+                            yield OpenAIAdapter.create_chat_completion_chunk(
+                                chunk_id, requested_model, content=clean_chunk
+                            )
+                    # if inside_tool_block: accumulate silently — do not yield raw JSON chunks
+                else:
                     yield OpenAIAdapter.create_chat_completion_chunk(
                         chunk_id, requested_model, content=clean_chunk
                     )
@@ -483,9 +497,27 @@ class CliEngine:
                 chunk_id, requested_model, content=f"\n[OpenAGY Local CLI Error: {e}]"
             )
 
+        # ── Post-process: check for quota/auth errors embedded in the accumulated output ──
+        full_text = "".join(accumulated_output)
+
+        # Detect RESOURCE_EXHAUSTED (quota 429) from agy exit code 3 error message
+        if "RESOURCE_EXHAUSTED" in full_text or "Individual quota reached" in full_text or "exit code 3" in full_text:
+            import re as _re
+            reset_match = _re.search(r"Resets in ([\w]+)", full_text)
+            reset_info = f" Resets in {reset_match.group(1)}." if reset_match else ""
+            logger.warning(f"AGY quota exhausted (429) for model {resolved_model}.{reset_info}")
+            error_msg = (
+                f"\n\n⚠️ **Quota esgotada** para `{resolved_model}`."
+                f"{reset_info} Troque o modelo ou aguarde o reset da cota."
+            )
+            yield OpenAIAdapter.create_chat_completion_chunk(
+                chunk_id, requested_model, content=error_msg, finish_reason="stop"
+            )
+            yield "data: [DONE]\n\n"
+            return
+
         # After process completes: if tools are defined, check if a tool was called
         if is_tool_mode:
-            full_text = "".join(accumulated_output)
             tool_data = self._parse_tool_call(full_text)
             if tool_data:
                 tool_name = tool_data.get("name", "")

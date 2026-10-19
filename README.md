@@ -98,16 +98,18 @@ A ponte registra e disponibiliza no seletor de modelos do OpenCode os seguintes 
 
 ### 🐧 Linux
 
+1. **Instalação e configuração automática:**
 ```bash
-# 1. Clone o repositório
-git clone https://github.com/schwenck-e/openagy.git
-cd openagy
-
-# 2. Execute a instalação automática
 chmod +x install.sh run.sh
 ./install.sh
+```
+> **Nota para Debian/Ubuntu:** Se o pacote do ambiente virtual não estiver instalado, instale com:
+> ```bash
+> sudo apt update && sudo apt install -y python3 python3-venv python3-pip
+> ```
 
-# 3. Inicie o servidor da ponte
+2. **Iniciar a ponte:**
+```bash
 ./run.sh
 ```
 
@@ -115,39 +117,41 @@ chmod +x install.sh run.sh
 
 ### 🪟 Windows
 
-Você pode usar o **Prompt de Comando (CMD)** ou o **PowerShell**:
-
-#### Opção A: Prompt de Comando (CMD)
+#### Opção 1: Via Prompt de Comando (CMD)
+1. **Instalação e configuração automática:**
 ```cmd
-git clone https://github.com/schwenck-e/openagy.git
-cd openagy
 install.bat
+```
+2. **Iniciar a ponte:**
+```cmd
 run.bat
 ```
 
-#### Opção B: PowerShell
+#### Opção 2: Via PowerShell
+1. **Instalação e configuração automática:**
 ```powershell
-git clone https://github.com/schwenck-e/openagy.git
-cd openagy
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\install.ps1
+```
+> **Nota:** Se o PowerShell bloquear a execução de scripts locais, habilite na sessão atual:
+> ```powershell
+> Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+> ```
+2. **Iniciar a ponte:**
+```powershell
 .\run.ps1
 ```
-
-> **Dica Windows:** Caso prefira configurar o OpenCode manualmente sem reinstalar dependências, execute a qualquer momento:
-> ```cmd
-> python setup_opencode.py
-> ```
 
 ---
 
 ### 🍎 macOS
 
+1. **Instalação e configuração automática:**
 ```bash
-git clone https://github.com/schwenck-e/openagy.git
-cd openagy
 chmod +x install.sh run.sh
 ./install.sh
+```
+2. **Iniciar a ponte:**
+```bash
 ./run.sh
 ```
 
@@ -155,9 +159,9 @@ chmod +x install.sh run.sh
 
 ## ⚙️ Estrutura de Configuração no OpenCode
 
-O script de instalação e o utilitário `setup_opencode.py` atualizam automaticamente seu `opencode.json` (preservando comentários, schemas e servidores MCP existentes, como `zrq-engine`). 
+O script [setup_opencode.py](file:///Users/egsl/Documents/projects/openagy/setup_opencode.py) atualiza o arquivo `opencode.json` de forma segura, criando um backup timestamped (`opencode.json.bak-<timestamp>`) e preservando quaisquer outros provedores e servidores MCP pré-existentes (como `zrq-engine`).
 
-Caso queira inspecionar ou configurar manualmente, o bloco registrado é:
+A configuração inserida no arquivo segue o formato exigido pelo OpenCode:
 
 ```json
 {
@@ -168,10 +172,7 @@ Caso queira inspecionar ou configurar manualmente, o bloco registrado é:
       "npm": "@ai-sdk/openai-compatible",
       "options": {
         "baseURL": "http://127.0.0.1:8080/v1",
-        "apiKey": "openagy-key",
-        "timeout": 600000,
-        "headerTimeout": 600000,
-        "chunkTimeout": 900000
+        "apiKey": "openagy-key"
       },
       "models": {
         "gemini-3.8-flash-high": {
@@ -219,40 +220,79 @@ Caso queira inspecionar ou configurar manualmente, o bloco registrado é:
 
 ## 🛠️ Suporte a Chamadas de Ferramentas (Tool Calling)
 
-O OpenAGY traduz as definições de ferramentas padrão enviadas pelo OpenCode no protocolo OpenAI para as instruções nativas compreendidas pelo Antigravity:
+O OpenCode utiliza chamadas de ferramentas (Function Calling) para ler arquivos, aplicar edições de código e executar comandos de terminal.
 
-1. **Injeção de Esquema:** Ferramentas passadas em `tools` são injetadas nas instruções de sistema do modelo.
-2. **Reconhecimento de Bloco:** Quando o modelo decide invocar uma ferramenta, ele emite um bloco estruturado ````tool_call { ... } ````.
-3. **Tradução OpenAI:** A ponte intercepta a resposta, monta o objeto `tool_calls` padrão da OpenAI com `call_id` e dispara o evento com `finish_reason: "tool_calls"`.
-4. **Alimentação de Resultados:** As respostas retornadas pelo OpenCode sob a role `tool` são reintroduzidas no contexto da conversa em turnos subsequentes.
+### 1. Tradução em Tempo Real
+Quando o OpenCode envia ferramentas no parâmetro `tools` do request da OpenAI:
+1. O OpenAGY formata as especificações das ferramentas nas instruções de sistema do modelo.
+2. O modelo emite blocos estructurados de chamada de função (`tool_call`).
+3. O OpenAGY intercepta o bloco e o devolve ao OpenCode como um evento delta padrão da OpenAI (`delta.tool_calls`), acionando a execução automática da ferramenta pelo OpenCode.
+
+### 2. Permissões Headless Automáticas
+Em execuções não interativas ou headless do Antigravity, o `jetski` poderia bloquear comandos com:
+> `jetski: no output produced — a tool required the "command" permission that headless mode cannot prompt for, so it was auto-denied.`
+
+Para evitar esse problema, o OpenAGY:
+* Passa automaticamente a flag `--dangerously-skip-permissions` na chamada local do `agy`.
+* Pré-autoriza as regras em `~/.gemini/antigravity-cli/settings.json`:
+  ```json
+  {
+    "permissions": {
+      "allow": [
+        "command(*)",
+        "command()",
+        "read_file(*)",
+        "edit_file(*)",
+        "*"
+      ]
+    }
+  }
+  ```
 
 ---
 
 ## 🔧 Variáveis de Ambiente & Parâmetros de Inicialização
 
-A ponte pode ser customizada através de variáveis de ambiente no arquivo `.env` ou passadas no shell:
+Você pode customizar o comportamento da ponte tanto por linha de comando quanto definindo variáveis de ambiente:
 
-| Variável | Padrão | Descrição |
-| :--- | :--- | :--- |
-| `OPENAGY_HOST` | `127.0.0.1` | Endereço IP em que a ponte escuta requisições. |
-| `OPENAGY_PORT` | `8080` | Porta local da API OpenAI-compatível. |
-| `OPENAGY_API_KEY` | `openagy-key` | Chave de API exigida para autorização das requisições. |
-| `OPENAGY_REQUIRE_KEY` | `false` | Se `true`, valida estritamente o Bearer Token. Se `false`, aceita requisições locais. |
-| `OPENAGY_AGY_BIN` | *(auto-detectado)* | Caminho explícito para o executável `agy` ou `agy.exe`. |
-| `OPENAGY_LOG_LEVEL` | `INFO` | Nível de verbosidade do log (`DEBUG`, `INFO`, `WARNING`, `ERROR`). |
+| Variável de Ambiente | Argumento CLI | Padrão | Descrição |
+| :--- | :--- | :--- | :--- |
+| `OPENAGY_HOST` | `--host` | `127.0.0.1` | Endereço de escuta do servidor HTTP |
+| `OPENAGY_PORT` | `--port` | `8080` | Porta TCP do servidor |
+| `OPENAGY_API_KEY` | `--api-key` | `openagy-key` | Chave de API para autenticação |
+| `OPENAGY_REQUIRE_KEY` | `--require-key` | `false` | Se ativo, rejeita requisições sem o Bearer token correspondente |
+| `OPENAGY_AGY_BIN` | N/A | *(Automático)* | Caminho customizado para o executável do Antigravity (`agy`) |
+| `OPENAGY_ENGINE` | `--engine` | `cli` | Motor de backend (`cli` para local ou `cloudcode`) |
+| `OPENAGY_LOG_LEVEL` | N/A | `INFO` | Nível de log (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `OPENCODE_CONFIG_PATH` | `--config` *(no setup)* | *(Automático)* | Caminho customizado para o arquivo `opencode.json` |
+
+### Exemplo de Inicialização com Parâmetros Customizados:
+```bash
+# Rodar em porta diferente com chave customizada
+python3 main.py --port 9000 --api-key minha-chave-secreta --require-key
+```
+
+E para configurar o OpenCode com esses mesmos parâmetros:
+```bash
+python3 setup_opencode.py --port 9000 --key minha-chave-secreta
+```
 
 ---
 
 ## 🔍 Validação e Diagnóstico Local
 
-Após iniciar a ponte, você pode testar a integridade dos serviços pelo terminal:
-
-### 1. Teste de Conexão Rápida:
+### 1. Testar o Antigravity Local diretamente:
 ```bash
-curl http://127.0.0.1:8080/
+python3 test_local_agy.py
+```
+Esse script envia uma solicitação simples ao executável local e valida se o streaming via terminal/pipes está respondendo corretamente.
+
+### 2. Verificar o status da ponte:
+```bash
+curl http://127.0.0.1:8080/health
 ```
 
-### 2. Resposta esperada:
+Resposta esperada:
 ```json
 {
   "status": "healthy",
