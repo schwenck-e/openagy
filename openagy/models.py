@@ -3,6 +3,24 @@ from typing import Dict, Any, List
 
 AVAILABLE_MODELS: List[Dict[str, Any]] = [
     {
+        "id": "gemini-4-argon-low",
+        "name": "Gemini 4 Argon (Low Latency)",
+        "description": "Ultra fast latest flagship Gemini 4 model",
+        "context_window": 1048576,
+    },
+    {
+        "id": "gemini-4-argon-medium",
+        "name": "Gemini 4 Argon (Medium)",
+        "description": "Balanced high performance Gemini 4 model",
+        "context_window": 1048576,
+    },
+    {
+        "id": "gemini-4-argon-high",
+        "name": "Gemini 4 Argon (High)",
+        "description": "Deep reasoning Gemini 4 model",
+        "context_window": 1048576,
+    },
+    {
         "id": "gemini-3.8-flash-high",
         "name": "Gemini 3.8 Flash (High Reasoning)",
         "description": "Default flagship fast reasoning model on Antigravity",

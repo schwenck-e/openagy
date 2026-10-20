@@ -154,7 +154,8 @@ class CliEngine:
             if self.bin_path.lower().endswith((".cmd", ".bat")):
                 return 7200
             return 28000
-        return 200000
+        # Optimal budget for fast response times while preserving recent conversation turns
+        return 48000
 
     def _extract_prompt(self, messages: list, tools: Optional[list] = None, max_length: int = 28000) -> str:
         """
