@@ -87,19 +87,9 @@ class Config:
     # Antigravity CLI binary path (resolved cross-platform)
     AGY_BIN: str = find_default_agy_bin()
 
-    # Backend endpoints used by Antigravity CLI
-    # Antigravity uses cloudcode-pa (production) and daily-cloudcode-pa (staging)
-    UPSTREAM_URL: str = os.getenv(
-        "OPENAGY_UPSTREAM_URL",
-        "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
-    )
-    BACKUP_UPSTREAM_URL: str = "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
-
-    LOAD_CODE_ASSIST_URL: str = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
-    BACKUP_LOAD_CODE_ASSIST_URL: str = "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
-
-    # Default engine: "cli" connects to the local Antigravity binary (agy)
-    ENGINE: str = os.getenv("OPENAGY_ENGINE", "cli")
+    # Sole supported engine: "cli" delegates all execution strictly through the local Antigravity binary ('agy').
+    # This guarantees 100% of network traffic, auth, and Google communications occur exclusively via the official CLI.
+    ENGINE: str = "cli"
 
     # Logging level
     LOG_LEVEL: str = os.getenv("OPENAGY_LOG_LEVEL", "INFO")

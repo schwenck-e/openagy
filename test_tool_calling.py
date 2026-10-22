@@ -8,14 +8,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("test_tool_calling")
 
 async def run_tests():
-    from openagy.engines.cli_engine import CliEngine
+    from openagy.server import get_engine
+    from openagy.config import config
 
     print("=" * 60)
-    print(" 🛠️ Teste de Tool Calling e Latência (Antigravity Local)")
+    print(f" 🛠️ Teste de Tool Calling e Latência (Engine: {config.ENGINE})")
     print("=" * 60)
 
-    engine = CliEngine()
-    print(f"[✓] Executável local: {engine.bin_path}")
+    engine = get_engine()
 
     # Teste 1: Medição de Latência (Time to First Token)
     print("\n[1/2] Testando Latência de Inicialização e Streaming:")
@@ -24,9 +24,9 @@ async def run_tests():
     total_tokens = 0
 
     req_latency = {
-        "model": "gemini-3.8-flash-high",
+        "model": "gemini-3.8-flash-low",
         "messages": [
-            {"role": "user", "content": "Conte rapidamente de 1 a 5 com um espaço entre eles e pare."}
+            {"role": "user", "content": "Conte de 1 a 5."}
         ]
     }
 
@@ -57,7 +57,7 @@ async def run_tests():
     # Teste 2: Chamada de Ferramenta (Tool Calling)
     print("\n[2/2] Testando Chamada de Ferramentas (Tool Calling):")
     req_tool = {
-        "model": "gemini-3.8-flash-high",
+        "model": "gemini-3.8-flash-low",
         "tools": [
             {
                 "type": "function",

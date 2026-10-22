@@ -11,9 +11,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from openagy.config import config
 from openagy.models import get_openai_models_response
-from openagy.engines.cloudcode_engine import CloudCodeEngine
 from openagy.engines.cli_engine import CliEngine
-from openagy.auth import auth_manager
 
 logger = logging.getLogger("openagy.server")
 
@@ -30,7 +28,7 @@ except Exception:
 
 app = FastAPI(
     title="OpenAGY - OpenCode to Antigravity Bridge",
-    description="Local OpenAI-compatible API bridge translating OpenCode requests into Google Antigravity executions.",
+    description="Local OpenAI-compatible API bridge translating OpenCode requests into Google Antigravity executions exclusively via the local 'agy' CLI.",
     version="0.1.0"
 )
 
@@ -45,7 +43,7 @@ app.add_middleware(
 
 security = HTTPBearer(auto_error=False)
 
-cloudcode_engine = CloudCodeEngine()
+# Sole execution engine: 100% delegated to local Antigravity CLI binary
 cli_engine = CliEngine()
 
 # Diagnostic request trackers
@@ -53,8 +51,7 @@ REQUEST_HISTORY = collections.deque(maxlen=30)
 ACTIVE_REQUESTS: Dict[str, Dict[str, Any]] = {}
 
 def get_engine():
-    if config.ENGINE == "cloudcode":
-        return cloudcode_engine
+    """Always returns the local CLI engine. All requests strictly pass through 'agy'."""
     return cli_engine
 
 def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Security(security)):

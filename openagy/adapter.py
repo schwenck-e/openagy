@@ -9,15 +9,30 @@ class OpenAIAdapter:
     the Google Cloud Code Assist / Antigravity protocol.
     """
 
-    @staticmethod
-    def openai_to_cloudcode_payload(openai_req: Dict[str, Any], resolved_model: str, project_id: Optional[str] = None) -> Dict[str, Any]:
+    THOUGHT_SIGNATURE_CACHE: Dict[str, str] = {}
+    LAST_THOUGHT_SIGNATURE: Optional[str] = None
+
+    @classmethod
+    def record_thought_signature(cls, call_id: str, signature: str):
+        """Caches thought signatures required for Gemini multi-turn tool calling."""
+        if signature:
+            if call_id:
+                cls.THOUGHT_SIGNATURE_CACHE[call_id] = signature
+            cls.LAST_THOUGHT_SIGNATURE = signature
+
+    @classmethod
+    def get_thought_signature(cls, call_id: str) -> Optional[str]:
+        return cls.THOUGHT_SIGNATURE_CACHE.get(call_id) or cls.LAST_THOUGHT_SIGNATURE
+
+    @classmethod
+    def openai_to_cloudcode_payload(cls, openai_req: Dict[str, Any], resolved_model: str, project_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Converts OpenAI Chat Completion request parameters to the
         Cloud Code Assist GenerateContent payload.
         """
         messages = openai_req.get("messages", [])
         system_instruction_parts = []
-        contents = []
+        raw_contents = []
 
         for msg in messages:
             role = msg.get("role", "user")
@@ -45,33 +60,46 @@ class OpenAIAdapter:
                     func = tc.get("function", {})
                     fn_name = func.get("name", "")
                     fn_args_raw = func.get("arguments", "{}")
+                    call_id = tc.get("id") or f"call_{uuid.uuid4().hex[:8]}"
                     try:
                         fn_args = json.loads(fn_args_raw) if isinstance(fn_args_raw, str) else fn_args_raw
                     except Exception:
                         fn_args = {}
-                    parts.append({
-                        "functionCall": {
-                            "name": fn_name,
-                            "args": fn_args
-                        }
-                    })
+                    
+                    fc_data = {
+                        "name": fn_name,
+                        "args": fn_args,
+                        "id": call_id
+                    }
+                    part_dict: Dict[str, Any] = {"functionCall": fc_data}
+                    
+                    sig = cls.get_thought_signature(call_id)
+                    if sig:
+                        part_dict["thoughtSignature"] = sig
+
+                    parts.append(part_dict)
                 
                 if parts:
-                    contents.append({"role": "model", "parts": parts})
+                    raw_contents.append({"role": "model", "parts": parts})
                 continue
 
             # Tool result message
             if role == "tool":
                 # Convert OpenAI tool response to Gemini functionResponse
                 tool_name = msg.get("name") or "tool"
+                call_id = msg.get("tool_call_id") or ""
                 tool_content = content if isinstance(content, str) else json.dumps(content)
-                contents.append({
+                f_resp: Dict[str, Any] = {
+                    "name": tool_name,
+                    "response": {"output": tool_content}
+                }
+                if call_id:
+                    f_resp["id"] = call_id
+
+                raw_contents.append({
                     "role": "user",
                     "parts": [{
-                        "functionResponse": {
-                            "name": tool_name,
-                            "response": {"output": tool_content}
-                        }
+                        "functionResponse": f_resp
                     }]
                 })
                 continue
@@ -79,12 +107,15 @@ class OpenAIAdapter:
             # User message
             parts = []
             if isinstance(content, str):
-                parts.append({"text": content})
+                if content:
+                    parts.append({"text": content})
             elif isinstance(content, list):
                 for item in content:
                     if isinstance(item, dict):
                         if item.get("type") == "text":
-                            parts.append({"text": item.get("text", "")})
+                            t = item.get("text", "")
+                            if t:
+                                parts.append({"text": t})
                         elif item.get("type") == "image_url":
                             # Support multimodal images if provided
                             img_url = item.get("image_url", {}).get("url", "")
@@ -102,7 +133,17 @@ class OpenAIAdapter:
                                 except Exception:
                                     pass
             if parts:
-                contents.append({"role": "user", "parts": parts})
+                raw_contents.append({"role": "user", "parts": parts})
+
+        # Merge consecutive turns of the same role (required by Gemini protocol)
+        merged_contents = []
+        for c in raw_contents:
+            if not c.get("parts"):
+                continue
+            if merged_contents and merged_contents[-1]["role"] == c["role"]:
+                merged_contents[-1]["parts"].extend(c["parts"])
+            else:
+                merged_contents.append(c)
 
         # Generation config
         generation_config: Dict[str, Any] = {}
@@ -114,7 +155,7 @@ class OpenAIAdapter:
             generation_config["maxOutputTokens"] = int(openai_req["max_tokens"])
 
         inner_request: Dict[str, Any] = {
-            "contents": contents,
+            "contents": merged_contents,
         }
 
         if system_instruction_parts:
@@ -146,7 +187,8 @@ class OpenAIAdapter:
             "request": inner_request,
         }
 
-        if project_id:
+        # Consumer projects (aicode-consumers, default-*) must not be passed in the project envelope
+        if project_id and project_id != "aicode-consumers" and not project_id.startswith("default-"):
             payload["project"] = project_id
 
         return payload

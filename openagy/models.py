@@ -76,6 +76,40 @@ AVAILABLE_MODELS: List[Dict[str, Any]] = [
     },
 ]
 
+# Mapping from requested OpenCode model IDs to real upstream CloudCode PA model keys
+BACKEND_MODEL_MAP: Dict[str, str] = {
+    # Gemini Flash models -> gemini-3.8-flash-tiered
+    "gemini-3.8-flash": "gemini-3.8-flash-tiered",
+    "gemini-3.8-flash-low": "gemini-3.8-flash-tiered",
+    "gemini-3.8-flash-medium": "gemini-3.8-flash-tiered",
+    "gemini-3.8-flash-high": "gemini-3.8-flash-tiered",
+    "gemini-3.7-flash-high": "gemini-3.8-flash-tiered",
+    "gemini-4-argon-low": "gemini-3.8-flash-tiered",
+    "gemini-4-argon-medium": "gemini-3.8-flash-tiered",
+    "gemini-4-argon-high": "gemini-3.8-flash-tiered",
+    "gemini-2.5-flash": "gemini-3.8-flash-tiered",
+    "gemini-2.0-flash": "gemini-3.8-flash-tiered",
+    "gpt-4o": "gemini-3.8-flash-tiered",
+    "gpt-4o-mini": "gemini-3.8-flash-tiered",
+    "o3-mini": "gemini-3.8-flash-tiered",
+
+    # Anthropic Claude models
+    "claude-sonnet-5-5-high": "claude-sonnet-5-5-high",
+    "claude-3-7-sonnet": "claude-sonnet-5-5-high",
+    "claude-3-5-sonnet": "claude-sonnet-5-5-high",
+    "claude-opus-5-5-high": "claude-opus-5-5-high",
+    "claude-3-opus": "claude-opus-5-5-high",
+
+    # Pro reasoning models -> claude-sonnet-5-5-high (high tier) or gemini-3.8-flash-tiered
+    "gemini-3.1-pro-high": "claude-sonnet-5-5-high",
+    "gemini-3.1-pro-low": "gemini-3.8-flash-tiered",
+    "gemini-2.5-pro": "claude-sonnet-5-5-high",
+    "o1": "claude-sonnet-5-5-high",
+
+    # Open weights
+    "gpt-oss-120b-medium": "gpt-oss-120b-medium",
+}
+
 # Aliases to gracefully redirect common model names from various tools to Antigravity models
 MODEL_ALIASES: Dict[str, str] = {
     "gemini-3.8-flash": "gemini-3.8-flash-high",
@@ -118,6 +152,20 @@ def resolve_model_name(requested_model: str) -> str:
             
     # Default to requested name if already matching an Antigravity model format
     return clean_name
+
+def resolve_backend_model(requested_model: str) -> str:
+    """Resolves a model name to the active upstream model ID supported by CloudCode PA."""
+    canonical = resolve_model_name(requested_model)
+    if canonical in BACKEND_MODEL_MAP:
+        return BACKEND_MODEL_MAP[canonical]
+    lower = canonical.lower()
+    if "claude" in lower:
+        if "opus" in lower:
+            return "claude-opus-5-5-high"
+        return "claude-sonnet-5-5-high"
+    if "gpt-oss" in lower:
+        return "gpt-oss-120b-medium"
+    return "gemini-3.8-flash-tiered"
 
 def get_openai_models_response() -> Dict[str, Any]:
     """Returns the /v1/models response in standard OpenAI JSON format."""

@@ -8,8 +8,8 @@ def main():
     parser = argparse.ArgumentParser(description="OpenAGY: OpenAI-Compatible Bridge for Antigravity (agy)")
     parser.add_argument("--host", type=str, default=config.HOST, help=f"Host to bind (default: {config.HOST})")
     parser.add_argument("--port", type=int, default=config.PORT, help=f"Port to bind (default: {config.PORT})")
-    parser.add_argument("--engine", type=str, choices=["cli", "cloudcode"], default=config.ENGINE,
-                        help="Backend engine: 'cli' (delegates to local Antigravity) or 'cloudcode' (direct API)")
+    parser.add_argument("--engine", type=str, choices=["cli"], default="cli",
+                        help="Backend engine: 'cli' (delegates strictly to local Antigravity binary 'agy')")
     parser.add_argument("--api-key", type=str, default=config.API_KEY, help="API Key required for requests")
     parser.add_argument("--require-key", action="store_true", default=config.REQUIRE_API_KEY,
                         help="Enforce API Key validation")

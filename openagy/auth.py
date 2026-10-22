@@ -1,6 +1,9 @@
+import base64
 import json
 import logging
 import os
+import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,31 +44,30 @@ class AuthManager:
                     logger.warning(f"Failed to read token file {path}: {e}")
         return None, None
 
-    def get_access_token(self, force_refresh: bool = False) -> str:
+    def load_keyring_token_data(self) -> Tuple[Optional[dict], Optional[str]]:
         """
-        Retrieves a valid access token. Reads directly from the local Antigravity
-        token store so any refresh performed by the CLI or IDE is picked up immediately.
+        Attempts to read OAuth token from OS Keyring (macOS Keychain).
+        Antigravity stores its primary active tokens securely in keyring when available.
         """
-        now = time.time()
-        
-        # If cache is valid and not forcing refresh, return it
-        if not force_refresh and self._cached_token and (self._token_expiry - now > 60):
-            return self._cached_token
+        if sys.platform == "darwin":
+            try:
+                out = subprocess.check_output(
+                    ["security", "find-generic-password", "-s", "gemini", "-a", "antigravity", "-w"],
+                    stderr=subprocess.DEVNULL
+                ).decode().strip()
+                if out.startswith("go-keyring-base64:"):
+                    raw = base64.b64decode(out.split(":", 1)[1]).decode("utf-8")
+                    data = json.loads(raw)
+                    return data, "keyring:gemini/antigravity"
+            except Exception as e:
+                logger.debug(f"macOS Keychain query for Antigravity token failed: {e}")
+        return None, None
 
-        data, path = self.load_token_data()
-        if not data:
-            raise RuntimeError(
-                f"Antigravity OAuth token not found in any expected location:\n"
-                f"  - {config.PRIMARY_TOKEN_PATH}\n"
-                f"  - {config.FALLBACK_TOKEN_PATH}\n"
-                f"Please ensure you are authenticated in the Antigravity CLI ('agy')."
-            )
-
+    def _parse_token_dict(self, data: dict, now: float) -> Tuple[Optional[str], Optional[str], float]:
         access_token = None
         refresh_token = None
-        expiry_ts = 0
+        expiry_ts = 0.0
 
-        # Pattern 1: antigravity-oauth-token format
         if "token" in data and isinstance(data["token"], dict):
             token_dict = data["token"]
             access_token = token_dict.get("access_token")
@@ -73,12 +75,10 @@ class AuthManager:
             expiry_str = token_dict.get("expiry")
             if expiry_str:
                 try:
-                    # ISO format timestamp parsing
                     dt = datetime.fromisoformat(expiry_str)
                     expiry_ts = dt.timestamp()
                 except Exception:
                     expiry_ts = now + 1800
-        # Pattern 2: oauth_creds.json format
         elif "access_token" in data:
             access_token = data.get("access_token")
             refresh_token = data.get("refresh_token")
@@ -86,20 +86,89 @@ class AuthManager:
             if expiry_date:
                 expiry_ts = float(expiry_date) / 1000.0 if float(expiry_date) > 1e11 else float(expiry_date)
 
-        if not access_token:
-            raise RuntimeError(f"Unable to parse access_token from {path}")
+        return access_token, refresh_token, expiry_ts
 
-        # Check if expired and refresh_token exists
-        if (expiry_ts and expiry_ts <= now + 30) or force_refresh:
-            logger.info("Access token is expired or expiring soon, attempting refresh...")
-            new_token = self._refresh_oauth_token(refresh_token, path, data)
-            if new_token:
-                access_token = new_token
-                expiry_ts = time.time() + 3500
+    def _trigger_agy_silent_refresh(self):
+        """Dispatches a quick silent invocation to agy to trigger Antigravity's internal token refresh."""
+        try:
+            agy_bin = config.AGY_BIN
+            if agy_bin and os.path.exists(agy_bin):
+                logger.info("Triggering background agy silent auth refresh...")
+                subprocess.run([agy_bin, "-v"], capture_output=True, timeout=5)
+        except Exception as e:
+            logger.debug(f"Silent agy refresh failed: {e}")
 
-        self._cached_token = access_token
-        self._token_expiry = expiry_ts or (now + 1800)
-        return access_token
+    def get_access_token(self, force_refresh: bool = False) -> str:
+        """
+        Retrieves a valid access token. Prioritizes the OS Keychain (where Antigravity
+        actively stores and updates refreshed tokens) before falling back to local files.
+        """
+        now = time.time()
+        
+        # If cache is valid and not forcing refresh, return it
+        if not force_refresh and self._cached_token and (self._token_expiry - now > 60):
+            return self._cached_token
+
+        # 1. Try OS Keyring (macOS Keychain) first
+        keyring_data, source = self.load_keyring_token_data()
+        if keyring_data:
+            access_token, refresh_token, expiry_ts = self._parse_token_dict(keyring_data, now)
+            if access_token and (expiry_ts > now + 30) and not force_refresh:
+                self._cached_token = access_token
+                self._token_expiry = expiry_ts
+                logger.debug(f"Loaded active token from {source} (expires in {int(expiry_ts - now)}s)")
+                return access_token
+
+        # 2. Try file token stores
+        data, path = self.load_token_data()
+        if data:
+            access_token, refresh_token, expiry_ts = self._parse_token_dict(data, now)
+            if access_token and (expiry_ts > now + 30) and not force_refresh:
+                self._cached_token = access_token
+                self._token_expiry = expiry_ts
+                logger.debug(f"Loaded active token from file {path} (expires in {int(expiry_ts - now)}s)")
+                return access_token
+
+        # 3. Token is expired or force refresh requested:
+        # Trigger silent agy run to let Antigravity refresh its keyring/file session
+        self._trigger_agy_silent_refresh()
+
+        # Re-check keyring after silent refresh
+        keyring_data, source = self.load_keyring_token_data()
+        if keyring_data:
+            access_token, refresh_token, expiry_ts = self._parse_token_dict(keyring_data, now)
+            if access_token:
+                self._cached_token = access_token
+                self._token_expiry = expiry_ts or (now + 3600)
+                logger.info(f"Refreshed token retrieved from {source}")
+                return access_token
+
+        # Re-check files after silent refresh
+        data, path = self.load_token_data()
+        if data:
+            access_token, refresh_token, expiry_ts = self._parse_token_dict(data, now)
+            if access_token:
+                self._cached_token = access_token
+                self._token_expiry = expiry_ts or (now + 3600)
+                logger.info(f"Refreshed token retrieved from {path}")
+                return access_token
+
+        # Fallback to direct refresh endpoint if tokens exist
+        if data and path:
+            _, refresh_token, _ = self._parse_token_dict(data, now)
+            if refresh_token:
+                new_token = self._refresh_oauth_token(refresh_token, path, data)
+                if new_token:
+                    self._cached_token = new_token
+                    self._token_expiry = time.time() + 3500
+                    return new_token
+
+        raise RuntimeError(
+            f"Antigravity OAuth token not found or invalid in Keychain or files:\n"
+            f"  - {config.PRIMARY_TOKEN_PATH}\n"
+            f"  - {config.FALLBACK_TOKEN_PATH}\n"
+            f"Please run 'agy' in your terminal once to log in."
+        )
 
     def get_project_id(self) -> Optional[str]:
         """
@@ -142,6 +211,13 @@ class AuthManager:
                     pass
 
         return None
+
+    @staticmethod
+    def is_consumer_project(project_id: Optional[str]) -> bool:
+        """Determines if a project ID is Google's internal consumer project (not a billing quota project)."""
+        if not project_id:
+            return True
+        return project_id in ("aicode-consumers", "default-cli-project") or project_id.startswith("default-")
 
     async def resolve_project_id(self, token: str) -> Optional[str]:
         """

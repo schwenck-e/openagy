@@ -19,7 +19,7 @@ ANSI_ESCAPE_PATTERN = re.compile(
 )
 
 TOOL_CALL_REGEX = re.compile(
-    r'(?:```(?:tool_call|json)?\s*|<tool_call>)\s*(\{[\s\S]*?\})\s*(?:```|</tool_call>)',
+    r'(?:```(?:tool_call|json:tool_call|json)?\s*|<tool_call>)\s*(\{[\s\S]*?\})\s*(?:```|</tool_call>)',
     re.MULTILINE
 )
 
@@ -33,18 +33,15 @@ class CliEngine:
     """
     Primary Engine: Executes completions by delegating directly to the
     locally installed Antigravity CLI ('agy') on the user's system.
-    This guarantees that the bridge does NOT connect to Google APIs directly;
-    instead, all networking, authentication, and model execution are handled
-    by the local Antigravity session.
+    Guarantees 100% of network traffic, auth, and model calls are handled
+    exclusively by the official local Antigravity binary on localhost.
 
     Now equipped with:
-    - Queue-buffered asynchronous subprocess streaming ensuring keep-alive pings
-      never cancel or kill the underlying subprocess.
-    - Robust, non-hanging pipe streaming on macOS, Linux, and Windows.
-    - Concurrent stderr draining to eliminate OS pipe buffer deadlocks.
+    - Native NDJSON streaming via '--output-format stream-json' for token-by-token fluid SSE.
     - Zero-latency initial SSE role handshake chunk (< 5ms) to satisfy client response timers.
-    - Native OpenAI Tool Calling / Function Calling support.
-    - Conversation history preservation and Windows command-line length budgeting.
+    - Structured XML/JSON tool calling translated directly into standard OpenAI delta.tool_calls.
+    - Disabled slash commands and skill scanning for fast turn execution.
+    - Conversation history preservation and OS command-line budget management.
     """
 
     def __init__(self):
@@ -91,35 +88,17 @@ class CliEngine:
 
     def _ensure_settings_permissions(self):
         """
-        Ensures ~/.gemini/antigravity-cli/settings.json has permissions.allow configured
-        so jetski in headless mode doesn't auto-deny tools.
+        Ensures ~/.gemini/antigravity-cli/settings.json exists with safe settings
+        so headless print mode operates smoothly.
         """
         settings_path = config.HOME / ".gemini" / "antigravity-cli" / "settings.json"
         try:
             settings_path.parent.mkdir(parents=True, exist_ok=True)
-            data = {}
-            if settings_path.exists():
-                with open(settings_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-
-            perms = data.get("permissions", {})
-            allow_list = perms.get("allow", [])
-
-            needed = ["command(*)", "command()", "read_file(*)", "edit_file(*)", "*"]
-            changed = False
-            for item in needed:
-                if item not in allow_list:
-                    allow_list.append(item)
-                    changed = True
-
-            if changed:
-                perms["allow"] = allow_list
-                data["permissions"] = perms
+            if not settings_path.exists():
                 with open(settings_path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=2)
-                logger.info(f"Updated permissions.allow in {settings_path}")
+                    json.dump({}, f)
         except Exception as e:
-            logger.debug(f"Could not update settings.json: {e}")
+            logger.debug(f"Could not verify settings.json: {e}")
 
     def _build_env(self) -> Dict[str, str]:
         """Prepares an execution environment ensuring PATH and UTF-8 encoding across macOS, Linux, and Windows."""
@@ -157,7 +136,7 @@ class CliEngine:
         # Optimal budget for fast response times while preserving recent conversation turns
         return 48000
 
-    def _extract_prompt(self, messages: list, tools: Optional[list] = None, max_length: int = 28000) -> str:
+    def _extract_prompt(self, messages: list, tools: Optional[list] = None, max_length: int = 48000) -> str:
         """
         Formats OpenAI conversation history and tools into a structured prompt,
         strictly budgeted to fit within OS command line limits (preventing WinError 206).
@@ -180,21 +159,22 @@ class CliEngine:
             if formatted_tools:
                 tools_json = json.dumps(formatted_tools, indent=None, ensure_ascii=False)
                 tool_prompt = (
-                    "You are operating as the language model engine for OpenCode.\n"
-                    "CRITICAL: Do NOT execute local CLI tools, shell commands, or file edits yourself.\n"
-                    "You only output completions. OpenCode has provided these workspace tools:\n"
+                    "You are operating as the AI language model for OpenCode.\n"
+                    "CRITICAL RULES:\n"
+                    "1. You are running as a pure completion engine. Do NOT execute local terminal commands, shell scripts, or file edits yourself.\n"
+                    "2. OpenCode provides workspace tools that OpenCode executes:\n"
                     f"{tools_json}\n\n"
-                    "If you need to call a tool, you MUST output a tool call block in this exact JSON format:\n"
-                    "```tool_call\n"
+                    "3. If you need to call a tool, you MUST output a tool call block in this exact XML/JSON format:\n"
+                    "<tool_call>\n"
                     "{\"name\": \"<function_name>\", \"arguments\": { ... }}\n"
-                    "```\n"
-                    "If no tool is required, respond directly and concisely with normal text."
+                    "</tool_call>\n\n"
+                    "4. If no tool is required, respond directly and concisely with standard markdown text."
                 )
                 system_instructions.append(tool_prompt)
         else:
             system_instructions.append(
-                "You are operating as the language model engine for OpenCode. "
-                "Provide direct, high-quality answers, code solutions, and explanations without invoking background CLI commands or tools."
+                "You are operating as the AI language model for OpenCode. "
+                "Provide direct, high-quality answers, code solutions, and explanations without invoking background terminal commands."
             )
 
         # 2. Process conversation history
@@ -233,7 +213,7 @@ class CliEngine:
                         fn = tc.get("function", {})
                         fn_name = fn.get("name", "")
                         fn_args = fn.get("arguments", "{}")
-                        tc_blocks.append(f"```tool_call\n{{\"name\": \"{fn_name}\", \"arguments\": {fn_args}}}\n```")
+                        tc_blocks.append(f"<tool_call>\n{{\"name\": \"{fn_name}\", \"arguments\": {fn_args}}}\n</tool_call>")
                     body = f"Assistant: {text_content}\n" + "\n".join(tc_blocks) if text_content else "Assistant:\n" + "\n".join(tc_blocks)
                     conversation_turns.append(body.strip())
                 elif text_content.strip():
@@ -279,8 +259,8 @@ class CliEngine:
         else:
             prompt_parts.append(
                 "[System Instruction]\n"
-                "You are operating as the language model engine for OpenCode. "
-                "Provide direct, high-quality answers, code solutions, and explanations without executing local terminal commands."
+                "You are operating as the AI language model for OpenCode. "
+                "Provide direct, high-quality answers, code solutions, and explanations."
             )
 
         if len(budgeted_turns) == 1 and budgeted_turns[0].startswith("User: "):
@@ -303,15 +283,20 @@ class CliEngine:
                 data = json.loads(raw_json)
                 if "name" in data:
                     return data
+                if "tool_call" in data and isinstance(data["tool_call"], dict):
+                    return data["tool_call"]
             except Exception:
                 pass
 
         trimmed = text.strip()
-        if trimmed.startswith("{") and trimmed.endswith("}"):
+        if "{" in trimmed and "}" in trimmed:
+            sub = trimmed[trimmed.find("{"):trimmed.rfind("}") + 1]
             try:
-                data = json.loads(trimmed)
+                data = json.loads(sub)
                 if "name" in data and ("arguments" in data or "parameters" in data):
                     return data
+                if "tool_call" in data and isinstance(data["tool_call"], dict):
+                    return data["tool_call"]
             except Exception:
                 pass
 
@@ -319,11 +304,9 @@ class CliEngine:
 
     async def _stream_subprocess_pipe(self, cmd: list[str]) -> AsyncGenerator[str, None]:
         """
-        Universal high-throughput, low-latency streaming using standard asyncio
+        Universal high-throughput, low-latency line streaming using standard asyncio
         subprocess pipes with an asynchronous queue and concurrent stderr draining.
-        - Heartbeat safe: queue reads can time out without cancelling the subprocess.
-        - Zero-hang EOF on macOS (no PTY kqueue bugs).
-        - Zero-deadlock on Windows (continuously empties stderr buffer).
+        Yields discrete NDJSON lines emitted by agy --output-format stream-json.
         """
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -339,10 +322,12 @@ class CliEngine:
         async def read_stdout():
             try:
                 while True:
-                    chunk = await proc.stdout.read(128)
-                    if not chunk:
+                    line_bytes = await proc.stdout.readline()
+                    if not line_bytes:
                         break
-                    await queue.put(chunk.decode("utf-8", errors="replace"))
+                    line_str = line_bytes.decode("utf-8", errors="replace").strip()
+                    if line_str:
+                        await queue.put(line_str)
             except Exception as e:
                 logger.debug(f"Stdout reader exception: {e}")
             finally:
@@ -364,7 +349,7 @@ class CliEngine:
         try:
             while True:
                 try:
-                    # Heartbeat: if no token for 3s, yield SSE keep-alive without cancelling reader
+                    # Heartbeat: if no line for 3s, yield SSE keep-alive without cancelling reader
                     chunk = await asyncio.wait_for(queue.get(), timeout=3.0)
                 except asyncio.TimeoutError:
                     yield ": ping\n\n"
@@ -376,7 +361,7 @@ class CliEngine:
 
                 yield chunk
 
-            # Await process exit and tasks cleanly without blocking indefinitely
+            # Await process exit cleanly
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5.0)
             except asyncio.TimeoutError:
@@ -400,11 +385,10 @@ class CliEngine:
             if proc.returncode != 0:
                 err_text = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
                 if err_text:
-                    logger.error(f"Antigravity process failed with code {proc.returncode}: {err_text}")
-                    yield f"\n[Antigravity Process Error (exit code {proc.returncode}): {err_text}]"
+                    logger.warning(f"Antigravity CLI process ended with code {proc.returncode}: {err_text[:200]}")
+                    yield json.dumps({"event": "result", "result": {"status": "ERROR", "error": err_text}})
 
         except asyncio.CancelledError:
-            # Client aborted connection
             if proc.returncode is None:
                 try:
                     proc.terminate()
@@ -443,8 +427,14 @@ class CliEngine:
         max_prompt_len = self._get_max_prompt_length()
         prompt = self._extract_prompt(openai_req.get("messages", []), tools=tools, max_length=max_prompt_len)
 
-        # Build command: all flags MUST precede '-p' for Go CLI flag parsing
-        cmd = [self.bin_path, "--dangerously-skip-permissions"]
+        # Build command: use official agy binary with --output-format stream-json
+        # and --disable-slash-commands for fast, pure token-level streaming
+        cmd = [
+            self.bin_path,
+            "--dangerously-skip-permissions",
+            "--disable-slash-commands",
+            "--output-format", "stream-json"
+        ]
         if resolved_model:
             cmd.extend(["--model", resolved_model])
         cmd.extend(["-p", prompt])
@@ -453,44 +443,73 @@ class CliEngine:
         if (os.name == "nt" or sys.platform == "win32") and self.bin_path.lower().endswith((".cmd", ".bat")):
             cmd = ["cmd.exe", "/c"] + cmd
 
-        logger.info(f"Delegating to local Antigravity CLI: {self.bin_path} (model: {resolved_model}, tools={len(tools)}, prompt_len={len(prompt)})")
+        logger.info(f"Delegating to local Antigravity CLI (NDJSON Stream): {self.bin_path} (model: {resolved_model}, tools={len(tools)}, prompt_len={len(prompt)})")
 
         stream_gen = self._stream_subprocess_pipe(cmd)
 
-        accumulated_output = []
+        accumulated_text_parts: List[str] = []
         is_tool_mode = bool(tools)
-        # Track whether we are inside a tool_call block to suppress raw JSON from the text stream
         inside_tool_block = False
 
         try:
-            async for raw_chunk in stream_gen:
-                if raw_chunk.startswith(":"):
-                    yield raw_chunk
+            async for raw_line in stream_gen:
+                if raw_line.startswith(":"):
+                    yield raw_line
                     continue
 
-                clean_chunk = strip_ansi(raw_chunk)
-                if not clean_chunk:
-                    continue
-
-                accumulated_output.append(clean_chunk)
-
-                if is_tool_mode:
-                    full_so_far = "".join(accumulated_output)
-                    # Once a tool_call block opens, suppress further raw output from the text stream.
-                    # This avoids sending raw JSON to the user while still accumulating it for parsing.
-                    if not inside_tool_block:
-                        if "```tool_call" in full_so_far or "<tool_call>" in full_so_far:
-                            inside_tool_block = True
-                        else:
-                            # Still within normal text — stream it so OpenCode sees activity
+                # Parse NDJSON event line from agy
+                try:
+                    event_data = json.loads(raw_line)
+                except Exception:
+                    # Non-JSON line from stdout fallback
+                    clean_text = strip_ansi(raw_line)
+                    if clean_text:
+                        accumulated_text_parts.append(clean_text)
+                        if not inside_tool_block:
                             yield OpenAIAdapter.create_chat_completion_chunk(
-                                chunk_id, requested_model, content=clean_chunk
+                                chunk_id, requested_model, content=clean_text
                             )
-                    # if inside_tool_block: accumulate silently — do not yield raw JSON chunks
-                else:
-                    yield OpenAIAdapter.create_chat_completion_chunk(
-                        chunk_id, requested_model, content=clean_chunk
-                    )
+                    continue
+
+                if not isinstance(event_data, dict):
+                    continue
+
+                evt = event_data.get("event")
+
+                # Handle incremental token updates
+                if evt == "step_update":
+                    su = event_data.get("step_update", {})
+                    text_delta = su.get("text_delta")
+                    if not text_delta:
+                        continue
+
+                    accumulated_text_parts.append(text_delta)
+                    full_so_far = "".join(accumulated_text_parts)
+
+                    if is_tool_mode:
+                        if not inside_tool_block:
+                            if "<tool_call>" in full_so_far or "```tool_call" in full_so_far or "```json:tool_call" in full_so_far:
+                                inside_tool_block = True
+                            else:
+                                # Normal conversational text emitted before any tool call
+                                yield OpenAIAdapter.create_chat_completion_chunk(
+                                    chunk_id, requested_model, content=text_delta
+                                )
+                        else:
+                            # Inside tool call block: accumulate silently to protect OpenCode chat UI from raw JSON
+                            pass
+                    else:
+                        yield OpenAIAdapter.create_chat_completion_chunk(
+                            chunk_id, requested_model, content=text_delta
+                        )
+
+                elif evt == "result":
+                    res_obj = event_data.get("result", {})
+                    if res_obj.get("status") == "ERROR":
+                        err_text = res_obj.get("error", "")
+                        if err_text:
+                            accumulated_text_parts.append(err_text)
+                        logger.warning(f"Antigravity CLI turn error: {err_text}")
 
         except Exception as e:
             logger.error(f"Error executing local Antigravity CLI: {e}")
@@ -498,10 +517,9 @@ class CliEngine:
                 chunk_id, requested_model, content=f"\n[OpenAGY Local CLI Error: {e}]"
             )
 
-        # ── Post-process: check for quota/auth errors embedded in the accumulated output ──
-        full_text = "".join(accumulated_output)
+        full_text = "".join(accumulated_text_parts)
 
-        # Detect RESOURCE_EXHAUSTED (quota 429) from agy exit code 3 error message
+        # Detect quota exhaustion (429) from agy
         if "RESOURCE_EXHAUSTED" in full_text or "Individual quota reached" in full_text or "exit code 3" in full_text:
             import re as _re
             reset_match = _re.search(r"Resets in ([\w]+)", full_text)
@@ -509,7 +527,7 @@ class CliEngine:
             logger.warning(f"AGY quota exhausted (429) for model {resolved_model}.{reset_info}")
             error_msg = (
                 f"\n\n⚠️ **Quota esgotada** para `{resolved_model}`."
-                f"{reset_info} Troque o modelo ou aguarde o reset da cota."
+                f"{reset_info} Troque o modelo no OpenCode ou aguarde o reset da cota."
             )
             yield OpenAIAdapter.create_chat_completion_chunk(
                 chunk_id, requested_model, content=error_msg, finish_reason="stop"
@@ -517,7 +535,7 @@ class CliEngine:
             yield "data: [DONE]\n\n"
             return
 
-        # After process completes: if tools are defined, check if a tool was called
+        # Handle tool calling emission for OpenCode
         if is_tool_mode:
             tool_data = self._parse_tool_call(full_text)
             if tool_data:
@@ -548,6 +566,7 @@ class CliEngine:
         yield "data: [DONE]\n\n"
 
     async def generate(self, openai_req: Dict[str, Any]) -> Dict[str, Any]:
+        """Handles non-streaming completion requests by collecting chunks."""
         full_text = []
         tool_calls = []
         requested_model = openai_req.get("model", "gemini-3.8-flash-high")
