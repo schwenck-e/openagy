@@ -13,7 +13,6 @@ PYTHON_BIN=""
 if command -v python3 &> /dev/null; then
     PYTHON_BIN="python3"
 elif command -v python &> /dev/null; then
-    # Verificar se python é versão 3
     if python -c "import sys; sys.exit(0 if sys.version_info[0] >= 3 else 1)" 2>/dev/null; then
         PYTHON_BIN="python"
     fi
@@ -24,6 +23,7 @@ if [ -z "$PYTHON_BIN" ]; then
     echo "   No Linux (Debian/Ubuntu): sudo apt install python3 python3-venv python3-pip"
     echo "   No Linux (Fedora/RHEL):   sudo dnf install python3 python3-pip"
     echo "   No Linux (Arch):          sudo pacman -S python python-pip"
+    echo "   No macOS:                 brew install python"
     exit 1
 fi
 echo "✓ Python 3 encontrado: $($PYTHON_BIN --version) ($PYTHON_BIN)"
@@ -86,8 +86,10 @@ echo " Como usar:"
 echo " 1. Inicie a ponte local executando:"
 echo "    ./run.sh"
 echo ""
-echo " 2. Abra o OpenCode e selecione qualquer modelo OpenAGY no seletor:"
-echo "    - openagy/gemini-3.8-flash-high"
+echo " 2. Abra o OpenCode e use qualquer modelo OpenAGY no seletor:"
+echo "    - openagy/gemini-3.8-flash-medium (Padrão para chat e subagentes)"
+echo "    - openagy/gemini-3.8-flash-low (Ultra baixa latência)"
+echo "    - openagy/gemini-3.8-flash-high (Raciocínio profundo)"
 echo "    - openagy/gemini-3.1-pro-high"
 echo "    - openagy/claude-sonnet-5-5-high"
 echo "============================================================"

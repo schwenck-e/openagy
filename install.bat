@@ -78,8 +78,10 @@ echo  Como iniciar a ponte:
 echo  1. Execute: run.bat
 echo     (ou no PowerShell: .\run.ps1)
 echo.
-echo  2. Abra o OpenCode e selecione os modelos OpenAGY no chat:
-echo     - openagy/gemini-3.8-flash-high
+echo  2. Abra o OpenCode e use qualquer modelo OpenAGY no seletor:
+echo     - openagy/gemini-3.8-flash-medium (Padrao para chat e subagentes)
+echo     - openagy/gemini-3.8-flash-low (Ultra rapido)
+echo     - openagy/gemini-3.8-flash-high (Raciocinio profundo)
 echo     - openagy/gemini-3.1-pro-high
 echo     - openagy/claude-sonnet-5-5-high
 echo ============================================================

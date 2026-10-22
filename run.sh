@@ -4,7 +4,7 @@ set -e
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$DIR"
 
-# Check Python
+# Detect Python
 PYTHON_BIN=""
 if command -v python3 &> /dev/null; then
     PYTHON_BIN="python3"
@@ -29,9 +29,9 @@ if [ -f "venv/bin/activate" ]; then
     source venv/bin/activate
     python -m pip install -q -r requirements.txt
     echo "🚀 Iniciando OpenAGY Bridge..."
-    python main.py "$@"
+    exec python main.py "$@"
 else
     "$PYTHON_BIN" -m pip install -q -r requirements.txt
     echo "🚀 Iniciando OpenAGY Bridge..."
-    "$PYTHON_BIN" main.py "$@"
+    exec "$PYTHON_BIN" main.py "$@"
 fi

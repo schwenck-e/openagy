@@ -71,7 +71,9 @@ Write-Host "   .\run.ps1" -ForegroundColor Yellow
 Write-Host "   (ou run.bat no Prompt de Comando)" -ForegroundColor Gray
 Write-Host ""
 Write-Host " Modelos prontos no OpenCode:" -ForegroundColor White
-Write-Host "   - openagy/gemini-3.8-flash-high" -ForegroundColor Cyan
+Write-Host "   - openagy/gemini-3.8-flash-medium (Padrao para chat e subagentes)" -ForegroundColor Cyan
+Write-Host "   - openagy/gemini-3.8-flash-low (Ultra rapido)" -ForegroundColor Cyan
+Write-Host "   - openagy/gemini-3.8-flash-high (Raciocinio profundo)" -ForegroundColor Cyan
 Write-Host "   - openagy/gemini-3.1-pro-high" -ForegroundColor Cyan
 Write-Host "   - openagy/claude-sonnet-5-5-high" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Green
