@@ -133,10 +133,11 @@ class CliEngine:
             if self.bin_path.lower().endswith((".cmd", ".bat")):
                 return 7200
             return 28000
-        # Optimal budget for fast response times while preserving recent conversation turns
-        return 48000
+        # POSIX (macOS/Linux) supports ARG_MAX >= 1MB. Budget up to 200,000 characters
+        # to ensure large tool schemas and full conversation history fit without truncation.
+        return 200000
 
-    def _extract_prompt(self, messages: list, tools: Optional[list] = None, max_length: int = 48000) -> str:
+    def _extract_prompt(self, messages: list, tools: Optional[list] = None, max_length: int = 200000) -> str:
         """
         Formats OpenAI conversation history and tools into a structured prompt,
         strictly budgeted to fit within OS command line limits (preventing WinError 206).
