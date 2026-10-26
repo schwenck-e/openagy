@@ -123,23 +123,13 @@ class CliEngine:
 
     def _get_max_prompt_length(self) -> int:
         """
-        Determines the safe character budget for the prompt argument.
-        Windows limits:
-        - cmd.exe /c: 8,191 characters
-        - CreateProcessW: 32,767 characters
-        POSIX limits:
-        - Linux/macOS ARG_MAX: 1-2 MB
+        Prompt is streamed directly via stdin (--input-format stream-json).
+        This eliminates the Windows CreateProcessW 32,767-character limit entirely,
+        safely accommodating massive multi-turn conversation histories and dozens of tool schemas.
         """
-        is_windows = (os.name == "nt" or sys.platform == "win32")
-        if is_windows:
-            if self.bin_path.lower().endswith((".cmd", ".bat")):
-                return 7200
-            return 28000
-        # POSIX (macOS/Linux) supports ARG_MAX >= 1MB. Budget up to 200,000 characters
-        # to ensure large tool schemas and full conversation history fit without truncation.
-        return 200000
+        return 500000
 
-    def _extract_prompt(self, messages: list, tools: Optional[list] = None, max_length: int = 200000) -> str:
+    def _extract_prompt(self, messages: list, tools: Optional[list] = None, max_length: int = 500000) -> str:
         """
         Formats OpenAI conversation history and tools into a structured prompt,
         strictly budgeted to fit within OS command line limits (preventing WinError 206).
@@ -305,18 +295,26 @@ class CliEngine:
 
         return None
 
-    async def _stream_subprocess_asyncio(self, cmd: list[str]) -> AsyncGenerator[str, None]:
+    async def _stream_subprocess_asyncio(self, cmd: list[str], prompt: str) -> AsyncGenerator[str, None]:
         """
-        High-throughput, low-latency line streaming using asyncio subprocess pipes.
+        High-throughput, low-latency line streaming using asyncio subprocess pipes with stdin prompt delivery.
         Yields discrete NDJSON lines emitted by agy --output-format stream-json.
         """
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=self._build_env()
         )
+
+        try:
+            msg = json.dumps({"event": "user", "message": {"content": prompt}}, ensure_ascii=False) + "\n"
+            proc.stdin.write(msg.encode("utf-8"))
+            await proc.stdin.drain()
+            proc.stdin.close()
+        except Exception as e:
+            logger.debug(f"Asyncio stdin write exception: {e}")
 
         queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
         stderr_chunks: List[bytes] = []
@@ -407,9 +405,9 @@ class CliEngine:
             if not stderr_task.done():
                 stderr_task.cancel()
 
-    async def _stream_subprocess_popen(self, cmd: list[str]) -> AsyncGenerator[str, None]:
+    async def _stream_subprocess_popen(self, cmd: list[str], prompt: str) -> AsyncGenerator[str, None]:
         """
-        Thread-safe subprocess streaming fallback using subprocess.Popen.
+        Thread-safe subprocess streaming fallback using subprocess.Popen with stdin prompt delivery.
         Operates reliably across all asyncio event loops on Windows (including SelectorEventLoop)
         without relying on loop-specific subprocess support.
         """
@@ -419,11 +417,23 @@ class CliEngine:
 
         proc = subprocess.Popen(
             cmd,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=self._build_env()
         )
+
+        def write_stdin():
+            try:
+                msg = json.dumps({"event": "user", "message": {"content": prompt}}, ensure_ascii=False) + "\n"
+                proc.stdin.write(msg.encode("utf-8"))
+                proc.stdin.flush()
+                proc.stdin.close()
+            except Exception as e:
+                logger.debug(f"Popen stdin write exception: {e}")
+
+        t_in = threading.Thread(target=write_stdin, daemon=True)
+        t_in.start()
 
         def read_stdout():
             try:
@@ -492,18 +502,18 @@ class CliEngine:
                 except Exception:
                     pass
 
-    async def _stream_subprocess_pipe(self, cmd: list[str]) -> AsyncGenerator[str, None]:
+    async def _stream_subprocess_pipe(self, cmd: list[str], prompt: str) -> AsyncGenerator[str, None]:
         """
-        Universal high-throughput, low-latency line streaming.
+        Universal high-throughput, low-latency line streaming via stdin NDJSON.
         Attempts native asyncio subprocess execution first; seamlessly falls back to thread-safe
         subprocess.Popen streaming if the current event loop lacks subprocess support (e.g. Windows SelectorEventLoop).
         """
         try:
-            async for chunk in self._stream_subprocess_asyncio(cmd):
+            async for chunk in self._stream_subprocess_asyncio(cmd, prompt):
                 yield chunk
         except NotImplementedError:
             logger.info("Current asyncio event loop lacks create_subprocess_exec; using thread-safe Popen streaming.")
-            async for chunk in self._stream_subprocess_popen(cmd):
+            async for chunk in self._stream_subprocess_popen(cmd, prompt):
                 yield chunk
 
     async def generate_stream(
@@ -525,25 +535,25 @@ class CliEngine:
         max_prompt_len = self._get_max_prompt_length()
         prompt = self._extract_prompt(openai_req.get("messages", []), tools=tools, max_length=max_prompt_len)
 
-        # Build command: use official agy binary with --output-format stream-json
-        # and --disable-slash-commands for fast, pure token-level streaming
+        # Build command: use official agy binary with NDJSON streaming both on stdout and stdin.
+        # This completely bypasses OS command-line length limits (e.g. Windows 32KB CreateProcessW).
         cmd = [
             self.bin_path,
             "--dangerously-skip-permissions",
             "--disable-slash-commands",
-            "--output-format", "stream-json"
+            "--output-format", "stream-json",
+            "--input-format", "stream-json"
         ]
         if resolved_model:
             cmd.extend(["--model", resolved_model])
-        cmd.extend(["-p", prompt])
 
         # On Windows, wrap .cmd and .bat binaries with cmd.exe /c if an exe was not resolved
         if (os.name == "nt" or sys.platform == "win32") and self.bin_path.lower().endswith((".cmd", ".bat")):
             cmd = ["cmd.exe", "/c"] + cmd
 
-        logger.info(f"Delegating to local Antigravity CLI (NDJSON Stream): {self.bin_path} (model: {resolved_model}, tools={len(tools)}, prompt_len={len(prompt)})")
+        logger.info(f"Delegating to local Antigravity CLI (NDJSON Stream via Stdin): {self.bin_path} (model: {resolved_model}, tools={len(tools)}, prompt_len={len(prompt)})")
 
-        stream_gen = self._stream_subprocess_pipe(cmd)
+        stream_gen = self._stream_subprocess_pipe(cmd, prompt)
 
         accumulated_text_parts: List[str] = []
         is_tool_mode = bool(tools)
