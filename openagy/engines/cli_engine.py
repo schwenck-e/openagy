@@ -4,7 +4,9 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
+import threading
 import uuid
 from typing import AsyncGenerator, Dict, Any, List, Optional, Tuple
 
@@ -303,10 +305,9 @@ class CliEngine:
 
         return None
 
-    async def _stream_subprocess_pipe(self, cmd: list[str]) -> AsyncGenerator[str, None]:
+    async def _stream_subprocess_asyncio(self, cmd: list[str]) -> AsyncGenerator[str, None]:
         """
-        Universal high-throughput, low-latency line streaming using standard asyncio
-        subprocess pipes with an asynchronous queue and concurrent stderr draining.
+        High-throughput, low-latency line streaming using asyncio subprocess pipes.
         Yields discrete NDJSON lines emitted by agy --output-format stream-json.
         """
         proc = await asyncio.create_subprocess_exec(
@@ -350,19 +351,16 @@ class CliEngine:
         try:
             while True:
                 try:
-                    # Heartbeat: if no line for 3s, yield SSE keep-alive without cancelling reader
                     chunk = await asyncio.wait_for(queue.get(), timeout=3.0)
                 except asyncio.TimeoutError:
                     yield ": ping\n\n"
                     continue
 
                 if chunk is None:
-                    # EOF reached
                     break
 
                 yield chunk
 
-            # Await process exit cleanly
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5.0)
             except asyncio.TimeoutError:
@@ -408,6 +406,105 @@ class CliEngine:
                 stdout_task.cancel()
             if not stderr_task.done():
                 stderr_task.cancel()
+
+    async def _stream_subprocess_popen(self, cmd: list[str]) -> AsyncGenerator[str, None]:
+        """
+        Thread-safe subprocess streaming fallback using subprocess.Popen.
+        Operates reliably across all asyncio event loops on Windows (including SelectorEventLoop)
+        without relying on loop-specific subprocess support.
+        """
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+        stderr_chunks: List[bytes] = []
+
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self._build_env()
+        )
+
+        def read_stdout():
+            try:
+                for line_bytes in iter(proc.stdout.readline, b""):
+                    line_str = line_bytes.decode("utf-8", errors="replace").strip()
+                    if line_str:
+                        loop.call_soon_threadsafe(queue.put_nowait, line_str)
+            except Exception as e:
+                logger.debug(f"Stdout thread reader exception: {e}")
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        def drain_stderr():
+            try:
+                while True:
+                    chunk = proc.stderr.read(1024)
+                    if not chunk:
+                        break
+                    stderr_chunks.append(chunk)
+            except Exception as e:
+                logger.debug(f"Stderr thread drain exception: {e}")
+
+        t_out = threading.Thread(target=read_stdout, daemon=True)
+        t_err = threading.Thread(target=drain_stderr, daemon=True)
+        t_out.start()
+        t_err.start()
+
+        try:
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(queue.get(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"
+                    continue
+
+                if chunk is None:
+                    break
+
+                yield chunk
+
+            try:
+                await asyncio.to_thread(proc.wait)
+            except Exception:
+                pass
+
+            t_out.join(timeout=1.0)
+            t_err.join(timeout=1.0)
+
+            if proc.returncode != 0:
+                err_text = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
+                if err_text:
+                    logger.warning(f"Antigravity CLI process ended with code {proc.returncode}: {err_text[:200]}")
+                    yield json.dumps({"event": "result", "result": {"status": "ERROR", "error": err_text}})
+
+        except asyncio.CancelledError:
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            raise
+        finally:
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    async def _stream_subprocess_pipe(self, cmd: list[str]) -> AsyncGenerator[str, None]:
+        """
+        Universal high-throughput, low-latency line streaming.
+        Attempts native asyncio subprocess execution first; seamlessly falls back to thread-safe
+        subprocess.Popen streaming if the current event loop lacks subprocess support (e.g. Windows SelectorEventLoop).
+        """
+        try:
+            async for chunk in self._stream_subprocess_asyncio(cmd):
+                yield chunk
+        except NotImplementedError:
+            logger.info("Current asyncio event loop lacks create_subprocess_exec; using thread-safe Popen streaming.")
+            async for chunk in self._stream_subprocess_popen(cmd):
+                yield chunk
 
     async def generate_stream(
         self,
@@ -513,9 +610,10 @@ class CliEngine:
                         logger.warning(f"Antigravity CLI turn error: {err_text}")
 
         except Exception as e:
-            logger.error(f"Error executing local Antigravity CLI: {e}")
+            logger.error(f"Error executing local Antigravity CLI: {e}", exc_info=True)
+            err_msg = str(e) or repr(e) or type(e).__name__
             yield OpenAIAdapter.create_chat_completion_chunk(
-                chunk_id, requested_model, content=f"\n[OpenAGY Local CLI Error: {e}]"
+                chunk_id, requested_model, content=f"\n[OpenAGY Local CLI Error: {err_msg}]"
             )
 
         full_text = "".join(accumulated_text_parts)

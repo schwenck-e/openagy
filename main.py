@@ -1,10 +1,23 @@
 import argparse
+import asyncio
 import logging
 import os
 import sys
 from openagy.config import config
 
+# Ensure UTF-8 output encoding across Windows consoles
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
 def main():
+    if sys.platform == "win32":
+        try:
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        except Exception:
+            pass
+
     parser = argparse.ArgumentParser(description="OpenAGY: OpenAI-Compatible Bridge for Antigravity (agy)")
     parser.add_argument("--host", type=str, default=config.HOST, help=f"Host to bind (default: {config.HOST})")
     parser.add_argument("--port", type=int, default=config.PORT, help=f"Port to bind (default: {config.PORT})")
@@ -15,7 +28,7 @@ def main():
                         help="Enforce API Key validation")
     parser.add_argument("--reload", dest="reload", action="store_true", help="Enable auto-reload on file changes")
     parser.add_argument("--no-reload", dest="reload", action="store_false", help="Disable auto-reload")
-    default_reload = os.getenv("OPENAGY_RELOAD", "true").lower() in ("true", "1", "yes")
+    default_reload = os.getenv("OPENAGY_RELOAD", "false").lower() in ("true", "1", "yes")
     parser.set_defaults(reload=default_reload)
 
     args = parser.parse_args()
@@ -42,7 +55,8 @@ def main():
 
     try:
         import uvicorn
-        uvicorn.run("openagy.server:app", host=config.HOST, port=config.PORT, reload=args.reload)
+        loop_opt = "asyncio:ProactorEventLoop" if sys.platform == "win32" else "auto"
+        uvicorn.run("openagy.server:app", host=config.HOST, port=config.PORT, reload=args.reload, loop=loop_opt)
     except ImportError:
         print("[!] Uvicorn not installed. Please install requirements with:")
         print("    pip install -r requirements.txt")
