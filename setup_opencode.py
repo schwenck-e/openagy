@@ -16,46 +16,98 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 ANTIGRAVITY_SETTINGS_PATH = Path.home() / ".gemini" / "antigravity-cli" / "settings.json"
 
 MODELS_CATALOG = {
+    "gemini-4-argon-low": {
+        "name": "Gemini 4 Argon (Low)",
+        "limit": {
+            "context": 1048576,
+            "output": 8192
+        }
+    },
+    "gemini-4-argon-medium": {
+        "name": "Gemini 4 Argon (Medium)",
+        "limit": {
+            "context": 1048576,
+            "output": 8192
+        }
+    },
+    "gemini-4-argon-high": {
+        "name": "Gemini 4 Argon (High)",
+        "limit": {
+            "context": 1048576,
+            "output": 8192
+        }
+    },
     "gemini-3.8-flash-low": {
-        "name": "Gemini 3.8 Flash Low (Fast / Low Latency)",
+        "name": "Gemini 3.8 Flash (Low)",
         "limit": {
             "context": 1048576,
             "output": 8192
         }
     },
     "gemini-3.8-flash-medium": {
-        "name": "Gemini 3.8 Flash Medium (Balanced)",
+        "name": "Gemini 3.8 Flash (Medium)",
         "limit": {
             "context": 1048576,
             "output": 8192
         }
     },
     "gemini-3.8-flash-high": {
-        "name": "Gemini 3.8 Flash High (Deep Reasoning)",
+        "name": "Gemini 3.8 Flash (High)",
         "limit": {
             "context": 1048576,
             "output": 8192
         }
     },
-    "gemini-3.1-pro-high": {
-        "name": "Gemini 3.1 Pro High (Antigravity)",
+    "claude-sonnet-5-5-low": {
+        "name": "Claude Sonnet 5.5 (Low)",
         "limit": {
-            "context": 2097152,
+            "context": 200000,
+            "output": 8192
+        }
+    },
+    "claude-sonnet-5-5-medium": {
+        "name": "Claude Sonnet 5.5 (Medium)",
+        "limit": {
+            "context": 200000,
             "output": 8192
         }
     },
     "claude-sonnet-5-5-high": {
-        "name": "Claude Sonnet 5.5 (Antigravity)",
+        "name": "Claude Sonnet 5.5 (High)",
+        "limit": {
+            "context": 200000,
+            "output": 8192
+        }
+    },
+    "claude-opus-5-5-low": {
+        "name": "Claude Opus 5.5 (Low)",
+        "limit": {
+            "context": 200000,
+            "output": 8192
+        }
+    },
+    "claude-opus-5-5-medium": {
+        "name": "Claude Opus 5.5 (Medium)",
+        "limit": {
+            "context": 200000,
+            "output": 8192
+        }
+    },
+    "claude-opus-5-5-high": {
+        "name": "Claude Opus 5.5 (High)",
         "limit": {
             "context": 200000,
             "output": 8192
         }
     },
     "gpt-oss-120b-medium": {
-        "name": "GPT-OSS 120B (Antigravity)",
+        "name": "GPT-OSS 120B (Medium)",
         "limit": {
             "context": 128000,
             "output": 8192
@@ -168,28 +220,96 @@ def update_single_config(config_path: Path, port: int, api_key: str, default_mod
 
     print(f"✅ Arquivo atualizado com sucesso:\n   {config_path}")
 
+def enable_desktop_model_visibility():
+    """Habilita a visibilidade de todos os modelos do OpenAGY no OpenCode 2 Desktop (drafts.sqlite)."""
+    import sqlite3
+    import glob
+
+    candidate_dirs = []
+    if sys.platform == "win32" or os.name == "nt":
+        appdata = os.getenv("APPDATA")
+        if appdata:
+            candidate_dirs.append(Path(appdata) / "ai.opencode.desktop")
+    elif sys.platform == "darwin":
+        candidate_dirs.append(Path.home() / "Library" / "Application Support" / "ai.opencode.desktop")
+    else:
+        xdg = os.getenv("XDG_CONFIG_HOME")
+        if xdg:
+            candidate_dirs.append(Path(xdg) / "ai.opencode.desktop")
+        candidate_dirs.append(Path.home() / ".config" / "ai.opencode.desktop")
+
+    for d in candidate_dirs:
+        db_path = d / "drafts.sqlite"
+        if not db_path.exists():
+            continue
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=5.0)
+            cur = conn.cursor()
+            row = cur.execute(
+                "SELECT value FROM state WHERE name = ? AND key = ?",
+                ("opencode.global.dat", "model")
+            ).fetchone()
+            if row and row[0]:
+                state_obj = json.loads(row[0])
+            else:
+                state_obj = {"user": [], "recent": [], "favorite": [], "variant": {}}
+
+            user_list = state_obj.get("user", [])
+            # Preserve non-openagy models and replace openagy models with full catalog enabled
+            filtered_user = [
+                entry for entry in user_list
+                if not (isinstance(entry, dict) and entry.get("providerID") == "openagy")
+            ]
+            for m_id in MODELS_CATALOG.keys():
+                filtered_user.append({
+                    "providerID": "openagy",
+                    "modelID": m_id,
+                    "visibility": "show"
+                })
+            state_obj["user"] = filtered_user
+
+            now_ms = int(time.time() * 1000)
+            cur.execute(
+                """
+                INSERT INTO state (name, key, value, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(name, key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                ("opencode.global.dat", "model", json.dumps(state_obj, separators=(",", ":")), now_ms)
+            )
+            conn.commit()
+            conn.close()
+            print(f"👁️ Visibilidade dos modelos ativada no OpenCode Desktop:\n   {db_path}")
+        except Exception as e:
+            print(f"[!] Aviso: Não foi possível atualizar visibilidade em {db_path}: {e}")
+
 def reload_opencode():
     """Tenta recarregar a configuração do OpenCode daemon se o CLI estiver instalado."""
+    import glob
     candidates = [
         shutil.which("opencode"),
         str(Path.home() / ".bun" / "bin" / "opencode"),
         "/usr/local/bin/opencode",
         "/opt/homebrew/bin/opencode"
     ]
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        candidates.extend(glob.glob(os.path.join(appdata, "ai.opencode.desktop", "cli", "*", "opencode-cli*")))
     for c in candidates:
         if c and os.path.exists(c):
             try:
                 res = subprocess.run([c, "reload"], capture_output=True, text=True, timeout=5)
                 if res.returncode == 0:
-                    print("🔄 OpenCode daemon recarregado automaticamente (opencode reload).")
-                return
+                    print(f"🔄 OpenCode daemon recarregado automaticamente ({os.path.basename(c)} reload).")
             except Exception:
                 pass
 
 def setup_opencode(
     port: int = 8080,
     api_key: str = "openagy-key",
-    default_model: str = "openagy/gemini-3.8-flash-medium",
+    default_model: str = "openagy/gemini-4-argon-medium",
     custom_config: Optional[str] = None
 ):
     print("=" * 60)
@@ -213,6 +333,7 @@ def setup_opencode(
         print(f"   • openagy/{m_id} ({m_data['name']}) [Contexto: {ctx:,} tokens]")
 
     configure_antigravity_settings()
+    enable_desktop_model_visibility()
     reload_opencode()
 
     print("\n" + "=" * 60)
@@ -224,8 +345,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Configure OpenCode to use OpenAGY")
     parser.add_argument("--port", type=int, default=8080, help="Bridge port (default: 8080)")
     parser.add_argument("--key", type=str, default="openagy-key", help="API Key (default: openagy-key)")
-    parser.add_argument("--default-model", type=str, default="openagy/gemini-3.8-flash-medium",
-                        help="Default model for OpenCode and subagents (default: openagy/gemini-3.8-flash-medium)")
+    parser.add_argument("--default-model", type=str, default="openagy/gemini-4-argon-medium",
+                        help="Default model for OpenCode and subagents (default: openagy/gemini-4-argon-medium)")
     parser.add_argument("--config", type=str, default=None, help="Explicit path to opencode.json")
     args = parser.parse_args()
     setup_opencode(port=args.port, api_key=args.key, default_model=args.default_model, custom_config=args.config)
